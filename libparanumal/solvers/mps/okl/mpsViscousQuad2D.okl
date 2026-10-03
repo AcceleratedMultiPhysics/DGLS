@@ -1,0 +1,533 @@
+/*
+
+The MIT License (MIT)
+
+Copyright (c) 2017-2022 Tim Warburton, Noel Chalmers, Jesse Chan, Ali Karakus
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+*/
+
+
+// Explicit viscous remainder of the split viscous term (quads, 2D). With div u = 0,
+//   div( mu (grad u + grad u^T) ) = div(mu grad u) + (grad u)^T grad mu
+// (the mu grad(div u) term is dropped; kept discretely it is explicit with coefficient
+// nu0 and limits the time step), so
+//   V = (1/rho) [ div(mu grad u) + (grad u)^T grad mu ] - nu0 Lap u
+// with DG strong-form gradients and divergences and central fluxes (BR1), the same
+// operator for both Laplacians: V = 0 exactly when mu/rho = nu0 is uniform.
+// Step 1: S = [mu ux, mu uy, mu vx, mu vy, ux, uy, vx, vy];
+//         wall/inflow faces use the Dirichlet velocity as the trace (u* = g_D, as the ins
+//         divergence operator does), other faces the average.
+// Step 2: V from the divergences of (mu ux, mu uy), (mu vx, mu vy), (ux,uy), (vx,vy),
+//         plus the nodal (grad u)^T grad mu; boundary faces use the interior trace.
+
+@kernel void mpsViscousGradQuad2D(const dlong Nelements,
+                                  @restrict const  dfloat *  vgeo,
+                                  @restrict const  dfloat *  sgeo,
+                                  @restrict const  dfloat *  D,
+                                  @restrict const  dlong  *  vmapM,
+                                  @restrict const  dlong  *  vmapP,
+                                  @restrict const  int    *  EToB,
+                                  const dfloat time,
+                                  @restrict const  dfloat *  x,
+                                  @restrict const  dfloat *  y,
+                                  const dfloat nu,
+                                  @restrict const  dfloat *  mu,
+                                  @restrict const  dfloat *  U,
+                                  @restrict dfloat *  S){
+
+  for(dlong e=0;e<Nelements;++e;@outer(0)){
+
+    @shared dfloat s_D[p_Nq][p_Nq];
+    @shared dfloat s_u[p_Nq][p_Nq];
+    @shared dfloat s_v[p_Nq][p_Nq];
+
+    for(int j=0;j<p_Nq;++j;@inner(1)){
+      for(int i=0;i<p_Nq;++i;@inner(0)){
+        s_D[j][i] = D[j*p_Nq+i];
+        const dlong id = e*p_Np*p_NVfields + j*p_Nq + i;
+        s_u[j][i] = U[id + 0*p_Np];
+        s_v[j][i] = U[id + 1*p_Np];
+      }
+    }
+
+    for(int j=0;j<p_Nq;++j;@inner(1)){
+      for(int i=0;i<p_Nq;++i;@inner(0)){
+        const dlong gbase = e*p_Np*p_Nvgeo + j*p_Nq + i;
+        const dfloat rx = vgeo[gbase+p_Np*p_RXID], ry = vgeo[gbase+p_Np*p_RYID];
+        const dfloat sx = vgeo[gbase+p_Np*p_SXID], sy = vgeo[gbase+p_Np*p_SYID];
+
+        dfloat ur = 0, us = 0, vr = 0, vs = 0;
+        for(int n=0;n<p_Nq;++n){
+          ur += s_D[i][n]*s_u[j][n];  us += s_D[j][n]*s_u[n][i];
+          vr += s_D[i][n]*s_v[j][n];  vs += s_D[j][n]*s_v[n][i];
+        }
+        dfloat ux = rx*ur + sx*us, uy = ry*ur + sy*us;
+        dfloat vx = rx*vr + sx*vs, vy = ry*vr + sy*vs;
+
+        const dfloat uM = s_u[j][i], vM = s_v[j][i];
+        for (int f=0;f<p_Nfaces;++f) {
+          int fn = -1;
+          if (f==0 && j==0)      fn = i;
+          if (f==1 && i==p_Nq-1) fn = j;
+          if (f==2 && j==p_Nq-1) fn = i;
+          if (f==3 && i==0)      fn = j;
+          if (fn < 0) continue;
+
+          const dlong sk = e*p_Nfp*p_Nfaces + f*p_Nfp + fn;
+          const dfloat nx = sgeo[sk*p_Nsgeo+p_NXID];
+          const dfloat ny = sgeo[sk*p_Nsgeo+p_NYID];
+          const dfloat sc = sgeo[sk*p_Nsgeo+p_WIJID]*sgeo[sk*p_Nsgeo+p_SJID];
+          const dlong idP = vmapP[sk];
+          const dlong eP = idP/p_Np, nP = idP%p_Np;
+
+          dfloat du, dv;
+          const int bc = EToB[f+p_Nfaces*e];
+          if (bc>0) {
+            dfloat uB = uM, vB = vM;
+            const dlong idM = vmapM[sk];
+            insVelocityDirichletConditions2D(bc, nu, time, x[idM], y[idM], nx, ny, uM, vM, &uB, &vB);
+            du = uB - uM; dv = vB - vM;
+          } else {
+            du = 0.5*(U[eP*p_Np*p_NVfields + 0*p_Np + nP] - uM);
+            dv = 0.5*(U[eP*p_Np*p_NVfields + 1*p_Np + nP] - vM);
+          }
+          ux += sc*du*nx; uy += sc*du*ny;
+          vx += sc*dv*nx; vy += sc*dv*ny;
+        }
+
+        const dfloat m = mu[e*p_Np + j*p_Nq + i];
+        const dlong sid = e*p_Np*8 + j*p_Nq + i;
+        S[sid + 0*p_Np] = m*ux;
+        S[sid + 1*p_Np] = m*uy;
+        S[sid + 2*p_Np] = m*vx;
+        S[sid + 3*p_Np] = m*vy;
+        S[sid + 4*p_Np] = ux;
+        S[sid + 5*p_Np] = uy;
+        S[sid + 6*p_Np] = vx;
+        S[sid + 7*p_Np] = vy;
+      }
+    }
+  }
+}
+
+@kernel void mpsViscousDivQuad2D(const dlong Nelements,
+                                 @restrict const  dfloat *  vgeo,
+                                 @restrict const  dfloat *  sgeo,
+                                 @restrict const  dfloat *  D,
+                                 @restrict const  dlong  *  vmapP,
+                                 @restrict const  int    *  EToB,
+                                 const dfloat nu0,
+                                 @restrict const  dfloat *  rho,
+                                 @restrict const  dfloat *  gradMu,
+                                 @restrict const  dfloat *  S,
+                                 @restrict dfloat *  V){
+
+  for(dlong e=0;e<Nelements;++e;@outer(0)){
+
+    @shared dfloat s_D[p_Nq][p_Nq];
+    @shared dfloat s_S[8][p_Nq][p_Nq];
+
+    for(int j=0;j<p_Nq;++j;@inner(1)){
+      for(int i=0;i<p_Nq;++i;@inner(0)){
+        s_D[j][i] = D[j*p_Nq+i];
+        for (int k=0;k<8;++k) s_S[k][j][i] = S[e*p_Np*8 + k*p_Np + j*p_Nq + i];
+      }
+    }
+
+    for(int j=0;j<p_Nq;++j;@inner(1)){
+      for(int i=0;i<p_Nq;++i;@inner(0)){
+        const dlong gbase = e*p_Np*p_Nvgeo + j*p_Nq + i;
+        const dfloat rx = vgeo[gbase+p_Np*p_RXID], ry = vgeo[gbase+p_Np*p_RYID];
+        const dfloat sx = vgeo[gbase+p_Np*p_SXID], sy = vgeo[gbase+p_Np*p_SYID];
+
+        // rows (fx, fy): (mu ux, mu uy) = (0,1), (mu vx, mu vy) = (2,3), (ux, uy) = (4,5), (vx, vy) = (6,7)
+        const int kx[4] = {0, 2, 4, 6};
+        const int ky[4] = {1, 3, 5, 7};
+        dfloat div[4];
+        for (int r=0;r<4;++r) {
+          dfloat fxr = 0, fxs = 0, fyr = 0, fys = 0;
+          for(int n=0;n<p_Nq;++n){
+            fxr += s_D[i][n]*s_S[kx[r]][j][n];  fxs += s_D[j][n]*s_S[kx[r]][n][i];
+            fyr += s_D[i][n]*s_S[ky[r]][j][n];  fys += s_D[j][n]*s_S[ky[r]][n][i];
+          }
+          div[r] = rx*fxr + sx*fxs + ry*fyr + sy*fys;
+        }
+
+        for (int f=0;f<p_Nfaces;++f) {
+          int fn = -1;
+          if (f==0 && j==0)      fn = i;
+          if (f==1 && i==p_Nq-1) fn = j;
+          if (f==2 && j==p_Nq-1) fn = i;
+          if (f==3 && i==0)      fn = j;
+          if (fn < 0) continue;
+          if (EToB[f+p_Nfaces*e] > 0) continue; // interior trace on boundaries
+
+          const dlong sk = e*p_Nfp*p_Nfaces + f*p_Nfp + fn;
+          const dfloat nx = sgeo[sk*p_Nsgeo+p_NXID];
+          const dfloat ny = sgeo[sk*p_Nsgeo+p_NYID];
+          const dfloat sc = sgeo[sk*p_Nsgeo+p_WIJID]*sgeo[sk*p_Nsgeo+p_SJID];
+          const dlong idP = vmapP[sk];
+          const dlong eP = idP/p_Np, nP = idP%p_Np;
+          for (int r=0;r<4;++r) {
+            const dfloat fxP = S[eP*p_Np*8 + kx[r]*p_Np + nP];
+            const dfloat fyP = S[eP*p_Np*8 + ky[r]*p_Np + nP];
+            div[r] += sc*0.5*(nx*(fxP - s_S[kx[r]][j][i]) + ny*(fyP - s_S[ky[r]][j][i]));
+          }
+        }
+
+        // (grad u)^T grad mu
+        const dlong id = e*p_Np*p_NVfields + j*p_Nq + i;
+        const dfloat mux = gradMu[id + 0*p_Np], muy = gradMu[id + 1*p_Np];
+        const dfloat ux = s_S[4][j][i], uy = s_S[5][j][i], vx = s_S[6][j][i], vy = s_S[7][j][i];
+        const dfloat Bx = mux*ux + muy*vx;
+        const dfloat By = mux*uy + muy*vy;
+
+        const dfloat irho = 1.0/rho[e*p_Np + j*p_Nq + i];
+        V[id + 0*p_Np] = (div[0] + Bx)*irho - nu0*div[2];
+        V[id + 1*p_Np] = (div[1] + By)*irho - nu0*div[3];
+      }
+    }
+  }
+}
+
+// Curvature kappa = div n (n = grad phi/|grad phi|), clipped to |kappa| <= kappaMax, with the DG strong divergence and
+// central fluxes; boundary faces use the interior trace (a 90 degree contact angle), not
+// the wall velocity condition the ins divergence operator imposes.
+@kernel void mpsCurvatureQuad2D(const dlong Nelements,
+                                @restrict const  dfloat *  vgeo,
+                                @restrict const  dfloat *  sgeo,
+                                @restrict const  dfloat *  D,
+                                @restrict const  dlong  *  vmapP,
+                                @restrict const  int    *  EToB,
+                                const dfloat kappaMax,
+                                @restrict const  dfloat *  N,
+                                @restrict dfloat *  kappa){
+
+  for(dlong e=0;e<Nelements;++e;@outer(0)){
+
+    @shared dfloat s_D[p_Nq][p_Nq];
+    @shared dfloat s_nx[p_Nq][p_Nq];
+    @shared dfloat s_ny[p_Nq][p_Nq];
+
+    for(int j=0;j<p_Nq;++j;@inner(1)){
+      for(int i=0;i<p_Nq;++i;@inner(0)){
+        s_D[j][i] = D[j*p_Nq+i];
+        const dlong id = e*p_Np*p_NVfields + j*p_Nq + i;
+        s_nx[j][i] = N[id + 0*p_Np];
+        s_ny[j][i] = N[id + 1*p_Np];
+      }
+    }
+
+    for(int j=0;j<p_Nq;++j;@inner(1)){
+      for(int i=0;i<p_Nq;++i;@inner(0)){
+        const dlong gbase = e*p_Np*p_Nvgeo + j*p_Nq + i;
+        const dfloat rx = vgeo[gbase+p_Np*p_RXID], ry = vgeo[gbase+p_Np*p_RYID];
+        const dfloat sx = vgeo[gbase+p_Np*p_SXID], sy = vgeo[gbase+p_Np*p_SYID];
+
+        dfloat nxr = 0, nxs = 0, nyr = 0, nys = 0;
+        for(int n=0;n<p_Nq;++n){
+          nxr += s_D[i][n]*s_nx[j][n];  nxs += s_D[j][n]*s_nx[n][i];
+          nyr += s_D[i][n]*s_ny[j][n];  nys += s_D[j][n]*s_ny[n][i];
+        }
+        dfloat div = rx*nxr + sx*nxs + ry*nyr + sy*nys;
+
+        for (int f=0;f<p_Nfaces;++f) {
+          int fn = -1;
+          if (f==0 && j==0)      fn = i;
+          if (f==1 && i==p_Nq-1) fn = j;
+          if (f==2 && j==p_Nq-1) fn = i;
+          if (f==3 && i==0)      fn = j;
+          if (fn < 0) continue;
+          if (EToB[f+p_Nfaces*e] > 0) continue;
+
+          const dlong sk = e*p_Nfp*p_Nfaces + f*p_Nfp + fn;
+          const dfloat fnx = sgeo[sk*p_Nsgeo+p_NXID];
+          const dfloat fny = sgeo[sk*p_Nsgeo+p_NYID];
+          const dfloat sc = sgeo[sk*p_Nsgeo+p_WIJID]*sgeo[sk*p_Nsgeo+p_SJID];
+          const dlong idP = vmapP[sk];
+          const dlong eP = idP/p_Np, nP = idP%p_Np;
+          const dfloat nxP = N[eP*p_Np*p_NVfields + 0*p_Np + nP];
+          const dfloat nyP = N[eP*p_Np*p_NVfields + 1*p_Np + nP];
+          div += sc*0.5*(fnx*(nxP - s_nx[j][i]) + fny*(nyP - s_ny[j][i]));
+        }
+
+        // limit to the curvature the mesh resolves (kinks such as corners give ~ N/h)
+        if (kappaMax > 0.0) div = (div > kappaMax) ? kappaMax : ((div < -kappaMax) ? -kappaMax : div);
+        kappa[e*p_Np + j*p_Nq + i] = div;
+      }
+    }
+  }
+}
+
+// Least squares curvature (after Marchandise et al. 2007): on each band element of layer
+// 0 or 1, fit a cubic polynomial in scaled coordinates X = (x-xc)/L, Y = (y-yc)/L to phi at
+// the nodes of the element and (with weight wNbr) its face neighbours in the band. At every node, project
+// to the closest point of the fitted zero level (two Newton steps) and evaluate
+//   kappa = (phi_xx phi_y^2 - 2 phi_x phi_y phi_xy + phi_yy phi_x^2)/|grad phi|^3
+// there, so kappa is constant along normals across the smeared interface; clip to
+// |kappa| <= kappaMax. Other band elements get kappa = 0. (Neighbours off rank are ignored.)
+// With wallMirror, elements on a wall also fit the mirror images of their nodes, with values shifted so that the fit
+// satisfies d phi/dn = -cos(theta) at the wall (static contact angle theta; theta = 90 degrees: plain mirror).
+#define p_Nfit 10
+
+void mpsFitBasis(const dfloat X, const dfloat Y, dfloat *b){
+  b[0] = 1.0;  b[1] = X;    b[2] = Y;
+  b[3] = X*X;  b[4] = X*Y;  b[5] = Y*Y;
+  b[6] = X*X*X; b[7] = X*X*Y; b[8] = X*Y*Y; b[9] = Y*Y*Y;
+}
+
+// least squares cubic fit of phi on element e (weight 1) and its face neighbours in the band (weight wNbr), with the
+// contact angle mirror at walls (wallMirror 1: shift -2 d cos(theta); 2: scaled with the element plane gradient;
+// 3: scaled with the contact point gradient). Coefficients a in the coordinates ((x-c0)/L, (y-c1)/L). Returns 1 on success.
+int mpsFitLSQ(const dlong e, const dlong Nelements, const long long int *EToE, const int *elementLayer,
+              const dfloat *x, const dfloat *y, const int *EToB, const dlong *vmapM, const dfloat *sgeo,
+              const int wallMirror, const dfloat cosTheta, const dfloat wMirror, const dfloat L, const dfloat wNbr,
+              const dfloat *phi, dfloat *a, dfloat *ctr){
+  dfloat xc = 0.0, yc = 0.0;
+  for (int m=0;m<p_Np;++m) { xc += x[e*p_Np+m]; yc += y[e*p_Np+m]; }
+  xc /= p_Np; yc /= p_Np;
+  ctr[0] = xc; ctr[1] = yc;
+
+  // normal equations [A^T A | A^T b]
+  dfloat M[p_Nfit][p_Nfit+1];
+  for (int r=0;r<p_Nfit;++r) for (int c=0;c<=p_Nfit;++c) M[r][c] = 0.0;
+  for (int f=-1;f<p_Nfaces;++f) {
+    dlong ee = e;
+    if (f>=0) {
+      const long long int eP = EToE[e*p_Nfaces+f];
+      if (eP < 0 || eP >= Nelements || elementLayer[eP] < 0) continue;
+      ee = (dlong) eP;
+    }
+    const dfloat wgt = (f>=0) ? wNbr : 1.0;
+    if (wgt <= 0.0) continue;
+    for (int m=0;m<p_Np;++m) {
+      dfloat bb[p_Nfit];
+      mpsFitBasis((x[ee*p_Np+m]-xc)/L, (y[ee*p_Np+m]-yc)/L, bb);
+      const dfloat pv = phi[ee*p_Np+m];
+      for (int r=0;r<p_Nfit;++r) {
+        for (int c=0;c<p_Nfit;++c) M[r][c] += wgt*bb[r]*bb[c];
+        M[r][p_Nfit] += wgt*bb[r]*pv;
+      }
+    }
+  }
+  // wall faces: mirror images of the element's own nodes (weight wMirror), with values shifted so
+  // that d phi/dn = -cos(theta) on the fitted polynomial (theta = 90 degrees: plain mirror)
+  if (wallMirror) {
+    // wallMirror == 2: scale the shift with the element's |grad phi| (least squares plane on the element
+    // nodes), so that d phi/dn = -|grad phi| cos(theta) also when phi is not a distance function
+    dfloat gscale = 1.0;
+    if (wallMirror == 2) {
+      dfloat sxp = 0.0, syp = 0.0, sxx = 0.0, syy = 0.0;
+      for (int m=0;m<p_Np;++m) {
+        const dfloat Xm = (x[e*p_Np+m]-xc)/L, Ym = (y[e*p_Np+m]-yc)/L, pm = phi[e*p_Np+m];
+        sxp += Xm*pm; syp += Ym*pm; sxx += Xm*Xm; syy += Ym*Ym;
+      }
+      const dfloat gx = sxp/sxx, gy = syp/syy;   // the GLL grid is symmetric: the normal matrix is diagonal
+      gscale = sqrt(gx*gx + gy*gy)/L;
+      gscale = (gscale < 0.5) ? 0.5 : ((gscale > 2.0) ? 2.0 : gscale);
+    }
+    // wallMirror == 3: |grad phi| at the contact point from the wall trace alone. There
+    // grad phi = g(-cos(theta) n_w + sin(theta) t), so g = |d phi/ds|/sin(theta), with d phi/ds the derivative of
+    // the degree N interpolant of phi along the wall face at its zero (the normal derivative, which the mirror
+    // imposes, is not used). Without a zero on the face: at the face node with the smallest |phi|.
+    if (wallMirror == 3) {
+      const dfloat sinTheta = sqrt(fmax(1.0 - cosTheta*cosTheta, 1e-12));
+      int found = 0;
+      for (int f=0;f<p_Nfaces;++f) {
+        const int bcf = EToB[e*p_Nfaces+f];
+        if (!(bcf==1 || bcf==4 || bcf==5)) continue;
+        const dlong sk = e*p_Nfaces*p_Nfp + f*p_Nfp;
+        dfloat sN[p_Nfp], pN[p_Nfp];
+        const dlong id0 = vmapM[sk];
+        for (int i=0;i<p_Nfp;++i) {
+          const dlong idi = vmapM[sk+i];
+          sN[i] = sqrt((x[idi]-x[id0])*(x[idi]-x[id0]) + (y[idi]-y[id0])*(y[idi]-y[id0]));
+          pN[i] = phi[idi];
+        }
+        int ic = -1;
+        for (int i=0;i<p_Nfp-1;++i) if (pN[i]*pN[i+1] <= 0.0 && pN[i] != pN[i+1]) { ic = i; break; }
+        if (ic < 0 && found) continue;
+        dfloat sc;
+        if (ic >= 0) {
+          sc = sN[ic] - pN[ic]*(sN[ic+1]-sN[ic])/(pN[ic+1]-pN[ic]);
+        } else {
+          int im = 0;
+          for (int i=1;i<p_Nfp;++i) if (fabs(pN[i]) < fabs(pN[im])) im = i;
+          sc = sN[im];
+        }
+        // value and derivative of the interpolant at sc; Newton steps towards the zero if there is one
+        dfloat dp = 0.0;
+        for (int it=0; it<3; ++it) {
+          dfloat pv = 0.0; dp = 0.0;
+          for (int j=0;j<p_Nfp;++j) {
+            dfloat lj = 1.0, dlj = 0.0;
+            for (int m=0;m<p_Nfp;++m) if (m!=j) lj *= (sc-sN[m])/(sN[j]-sN[m]);
+            for (int k=0;k<p_Nfp;++k) {
+              if (k==j) continue;
+              dfloat t = 1.0/(sN[j]-sN[k]);
+              for (int m=0;m<p_Nfp;++m) if (m!=j && m!=k) t *= (sc-sN[m])/(sN[j]-sN[m]);
+              dlj += t;
+            }
+            pv += pN[j]*lj; dp += pN[j]*dlj;
+          }
+          if (ic < 0 || it == 2 || fabs(dp) < 1e-12) break;
+          sc -= pv/dp;
+          sc = (sc < sN[ic]) ? sN[ic] : ((sc > sN[ic+1]) ? sN[ic+1] : sc);
+        }
+        gscale = fabs(dp)/sinTheta;
+        gscale = (gscale < 0.5) ? 0.5 : ((gscale > 2.0) ? 2.0 : gscale);
+        if (ic >= 0) found = 1;
+      }
+    }
+    for (int f=0;f<p_Nfaces;++f) {
+      const int bcf = EToB[e*p_Nfaces+f];
+      if (!(bcf==1 || bcf==4 || bcf==5)) continue;   // walls only: no mirror on inflow/outflow faces
+      const dlong sk = e*p_Nfaces*p_Nfp + f*p_Nfp;
+      const dfloat nx = sgeo[sk*p_Nsgeo+p_NXID];
+      const dfloat ny = sgeo[sk*p_Nsgeo+p_NYID];
+      const dlong idF = vmapM[sk];
+      const dfloat xf = x[idF], yf = y[idF];
+      for (int m=0;m<p_Np;++m) {
+        const dfloat xm = x[e*p_Np+m], ym = y[e*p_Np+m];
+        const dfloat dn = (xm-xf)*nx + (ym-yf)*ny;
+        dfloat bb[p_Nfit];
+        mpsFitBasis((xm-2.0*dn*nx-xc)/L, (ym-2.0*dn*ny-yc)/L, bb);
+        // mirror value for the contact angle theta (measured in the phi < 0 fluid):
+        // d phi/dn_w = -cos(theta) gives phi(Rx) = phi(x) - 2 d cos(theta), d = -dn >= 0
+        const dfloat pv = phi[e*p_Np+m] + 2.0*dn*gscale*cosTheta;
+        for (int r=0;r<p_Nfit;++r) {
+          for (int c=0;c<p_Nfit;++c) M[r][c] += wMirror*bb[r]*bb[c];
+          M[r][p_Nfit] += wMirror*bb[r]*pv;
+        }
+      }
+    }
+  }
+  // Gaussian elimination with partial pivoting
+  int ok = 1;
+  for (int k=0;k<p_Nfit;++k) {
+    int piv = k; dfloat amax = fabs(M[k][k]);
+    for (int r=k+1;r<p_Nfit;++r) if (fabs(M[r][k]) > amax) { amax = fabs(M[r][k]); piv = r; }
+    if (amax < 1e-14) { ok = 0; break; }
+    if (piv != k) for (int c=0;c<=p_Nfit;++c) { const dfloat t = M[k][c]; M[k][c] = M[piv][c]; M[piv][c] = t; }
+    for (int r=k+1;r<p_Nfit;++r) {
+      const dfloat fct = M[r][k]/M[k][k];
+      for (int c=k;c<=p_Nfit;++c) M[r][c] -= fct*M[k][c];
+    }
+  }
+  if (ok) {
+    for (int k=p_Nfit-1;k>=0;--k) {
+      dfloat sum = M[k][p_Nfit];
+      for (int c=k+1;c<p_Nfit;++c) sum -= M[k][c]*a[c];
+      a[k] = sum/M[k][k];
+    }
+  }
+  return ok;
+}
+
+@kernel void mpsCurvatureLSQQuad2D(const dlong Nlist,
+                                   @restrict const  dlong  *  list,
+                                   const dlong Nelements,
+                                   @restrict const  long long int *  EToE,
+                                   @restrict const  int    *  elementLayer,
+                                   @restrict const  dfloat *  x,
+                                   @restrict const  dfloat *  y,
+                                   @restrict const  int    *  EToB,
+                                   @restrict const  dlong  *  vmapM,
+                                   @restrict const  dfloat *  sgeo,
+                                   const int wallMirror,
+                                   const dfloat cosTheta,
+                                   const dfloat wMirror,
+                                   const dfloat L,
+                                   const dfloat kappaMax,
+                                   const dfloat wNbr,
+                                   @restrict const  dfloat *  phi,
+                                   @restrict dfloat *  kappa){
+
+  for(dlong l=0;l<Nlist;++l;@outer(0)){
+
+    @shared dfloat s_a[p_Nfit];
+    @shared dfloat s_c[2];
+    @shared int s_ok[1];
+
+    const dlong e = list[l];
+    const int active = (elementLayer[e] >= 0 && elementLayer[e] <= 1);
+
+    for(int n=0;n<p_Np;++n;@inner(0)){
+      if (n==0) {
+        s_ok[0] = 0;
+        if (active) {
+          s_ok[0] = mpsFitLSQ(e, Nelements, EToE, elementLayer, x, y, EToB, vmapM, sgeo,
+                              wallMirror, cosTheta, wMirror, L, wNbr, phi, s_a, s_c);
+        }
+      }
+    }
+
+    for(int n=0;n<p_Np;++n;@inner(0)){
+      const dlong id = e*p_Np + n;
+      dfloat kap = 0.0;
+      if (s_ok[0]) {
+        const dfloat *a = s_a;
+        dfloat X = (x[id]-s_c[0])/L, Y = (y[id]-s_c[1])/L;
+        const dfloat X0 = X, Y0 = Y;
+        // closest point on the fitted zero level (in scaled coordinates)
+        for (int it=0;it<2;++it) {
+          const dfloat p  = a[0] + a[1]*X + a[2]*Y + a[3]*X*X + a[4]*X*Y + a[5]*Y*Y
+                          + a[6]*X*X*X + a[7]*X*X*Y + a[8]*X*Y*Y + a[9]*Y*Y*Y;
+          const dfloat pX = a[1] + 2.0*a[3]*X + a[4]*Y + 3.0*a[6]*X*X + 2.0*a[7]*X*Y + a[8]*Y*Y;
+          const dfloat pY = a[2] + a[4]*X + 2.0*a[5]*Y + a[7]*X*X + 2.0*a[8]*X*Y + 3.0*a[9]*Y*Y;
+          const dfloat g2 = pX*pX + pY*pY;
+          if (g2 < 1e-24) break;
+          X -= p*pX/g2; Y -= p*pY/g2;
+        }
+        // stay inside the patch
+        if (fabs(X) > 2.0 || fabs(Y) > 2.0) { X = X0; Y = Y0; }
+
+        const dfloat pX  = a[1] + 2.0*a[3]*X + a[4]*Y + 3.0*a[6]*X*X + 2.0*a[7]*X*Y + a[8]*Y*Y;
+        const dfloat pY  = a[2] + a[4]*X + 2.0*a[5]*Y + a[7]*X*X + 2.0*a[8]*X*Y + 3.0*a[9]*Y*Y;
+        const dfloat pXX = 2.0*a[3] + 6.0*a[6]*X + 2.0*a[7]*Y;
+        const dfloat pXY = a[4] + 2.0*a[7]*X + 2.0*a[8]*Y;
+        const dfloat pYY = 2.0*a[5] + 2.0*a[8]*X + 6.0*a[9]*Y;
+        const dfloat g2 = pX*pX + pY*pY;
+        if (g2 > 1e-24) {
+          // physical derivatives: d/dx = (1/L) d/dX
+          kap = (pXX*pY*pY - 2.0*pX*pY*pXY + pYY*pX*pX)/(g2*sqrt(g2))/L;
+        }
+        if (kappaMax > 0.0) kap = (kap > kappaMax) ? kappaMax : ((kap < -kappaMax) ? -kappaMax : kap);
+      }
+      kappa[id] = kap;
+    }
+  }
+}
+
+// blend of the reinitialized level set near walls: phi <- phiOld + beta w (phi - phiOld), w = 1 within L of a wall,
+// cosine taper to 0 at 2L
+@kernel void mpsWallBlend(const dlong N,
+                          const dfloat beta,
+                          const dfloat L,
+                          @restrict const  dfloat *  wallDist,
+                          @restrict const  dfloat *  phiOld,
+                          @restrict dfloat *  phi){
+  for(dlong n=0;n<N;++n;@tile(256,@outer,@inner)){
+    const dfloat dw = wallDist[n];
+    const dfloat w = (dw <= L) ? 1.0 : ((dw >= 2.0*L) ? 0.0 : 0.5*(1.0 + cos(M_PI*(dw-L)/L)));
+    phi[n] = phiOld[n] + beta*w*(phi[n] - phiOld[n]);
+  }
+}

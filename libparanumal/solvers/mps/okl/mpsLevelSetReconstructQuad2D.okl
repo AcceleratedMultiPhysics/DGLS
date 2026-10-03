@@ -1,0 +1,127 @@
+/*
+
+The MIT License (MIT)
+
+Copyright (c) 2017-2022 Tim Warburton, Noel Chalmers, Jesse Chan, Ali Karakus
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+*/
+
+
+dfloat minmod(const dfloat a, const dfloat b){
+  if (a*b <= 0.0) return 0.0;
+  return (fabs(a) < fabs(b)) ? a : b;
+}
+
+// Subcell edge states for the level set.
+//  - unmarked elements: nodal values (the DG trace) in all four fields
+//  - marked elements: piecewise linear reconstruction on the GLL subcells with
+//    minmod limited slopes (p_subcellOrder==2) or piecewise constant (==1).
+// Subcell i has width w_i (GLL weight) and centroid c_i; the subcell next to an
+// element face uses the neighbor's face value, assumed one subcell width away.
+// Next to domain boundaries or elements outside the band the slope is set to zero.
+// Output layout: phiEdge[e*Np*4 + fld*Np + n],
+//  fld 0/1: left/right edge in r, fld 2/3: left/right edge in s.
+@kernel void mpsLevelSetReconstructQuad2D(const dlong Nlist,
+                                          @restrict const  dlong  *  list,
+                                          @restrict const  dfloat *  gllw,
+                                          @restrict const  int    *  elementMark,
+                                          @restrict const  dlong  *  vmapP,
+                                          @restrict const  int    *  EToB,
+                                          @restrict const  int    *  elementLayer,
+                                          @restrict const  dfloat *  phi,
+                                          @restrict dfloat *  phiEdge){
+
+  for(dlong l=0;l<Nlist;++l;@outer(0)){
+
+    const dlong e = list[l];
+
+    @shared dfloat s_w[p_Nq];
+    @shared dfloat s_phi[p_Nq][p_Nq];
+
+    const int mark = elementMark[e];
+
+    for(int j=0;j<p_Nq;++j;@inner(1)){
+      for(int i=0;i<p_Nq;++i;@inner(0)){
+        if (j==0) s_w[i] = gllw[i];
+        s_phi[j][i] = phi[e*p_Np + j*p_Nq + i];
+      }
+    }
+
+    for(int j=0;j<p_Nq;++j;@inner(1)){
+      for(int i=0;i<p_Nq;++i;@inner(0)){
+
+        const int n = j*p_Nq + i;
+        const dfloat phin = s_phi[j][i];
+
+        dfloat Lr = phin, Rr = phin, Ls = phin, Rs = phin;
+
+        if (mark && p_subcellOrder==2) {
+          // r direction
+          dfloat dm = 0.0, dp = 0.0;
+          int ok = 1;
+          if (i>0) {
+            dm = (phin - s_phi[j][i-1])/(0.5*(s_w[i-1] + s_w[i]));
+          } else {
+            const dlong sk = e*p_Nfp*p_Nfaces + 3*p_Nfp + j;
+            if (EToB[3+p_Nfaces*e]>0 || elementLayer[vmapP[sk]/p_Np]<0) ok = 0;
+            else dm = (phin - phi[vmapP[sk]])/s_w[0];
+          }
+          if (i<p_Nq-1) {
+            dp = (s_phi[j][i+1] - phin)/(0.5*(s_w[i] + s_w[i+1]));
+          } else {
+            const dlong sk = e*p_Nfp*p_Nfaces + 1*p_Nfp + j;
+            if (EToB[1+p_Nfaces*e]>0 || elementLayer[vmapP[sk]/p_Np]<0) ok = 0;
+            else dp = (phi[vmapP[sk]] - phin)/s_w[p_Nq-1];
+          }
+          const dfloat sr = ok ? minmod(dm, dp) : 0.0;
+          Lr = phin - 0.5*s_w[i]*sr;
+          Rr = phin + 0.5*s_w[i]*sr;
+
+          // s direction
+          ok = 1;
+          if (j>0) {
+            dm = (phin - s_phi[j-1][i])/(0.5*(s_w[j-1] + s_w[j]));
+          } else {
+            const dlong sk = e*p_Nfp*p_Nfaces + 0*p_Nfp + i;
+            if (EToB[0+p_Nfaces*e]>0 || elementLayer[vmapP[sk]/p_Np]<0) ok = 0;
+            else dm = (phin - phi[vmapP[sk]])/s_w[0];
+          }
+          if (j<p_Nq-1) {
+            dp = (s_phi[j+1][i] - phin)/(0.5*(s_w[j] + s_w[j+1]));
+          } else {
+            const dlong sk = e*p_Nfp*p_Nfaces + 2*p_Nfp + i;
+            if (EToB[2+p_Nfaces*e]>0 || elementLayer[vmapP[sk]/p_Np]<0) ok = 0;
+            else dp = (phi[vmapP[sk]] - phin)/s_w[p_Nq-1];
+          }
+          const dfloat ss = ok ? minmod(dm, dp) : 0.0;
+          Ls = phin - 0.5*s_w[j]*ss;
+          Rs = phin + 0.5*s_w[j]*ss;
+        }
+
+        const dlong base = e*p_Np*4 + n;
+        phiEdge[base + 0*p_Np] = Lr;
+        phiEdge[base + 1*p_Np] = Rr;
+        phiEdge[base + 2*p_Np] = Ls;
+        phiEdge[base + 3*p_Np] = Rs;
+      }
+    }
+  }
+}

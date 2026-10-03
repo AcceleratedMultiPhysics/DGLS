@@ -1,0 +1,179 @@
+/*
+
+The MIT License (MIT)
+
+Copyright (c) 2017-2022 Tim Warburton, Noel Chalmers, Jesse Chan, Ali Karakus
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+*/
+
+
+// face edge state field for each local face (see mpsLevelSetReconstructQuad2D)
+int edgeField(const int f){
+  return (f==0) ? 2 : (f==1) ? 1 : (f==2) ? 3 : 0;
+}
+
+// upwind correction for strong form: (u.n)^- (phiM - phiP), lifted with GLL weights.
+// phiM/phiP are the edge states on each side: nodal DG traces in unmarked elements,
+// reconstructed subcell edge values in marked ones.
+void surfaceTerms(const int e,
+                  const int es,
+                  const int sk,
+                  const int face,
+                  const int i,
+                  const int j,
+                  const dfloat *sgeo,
+                  const dfloat t,
+                  const dfloat *x,
+                  const dfloat *y,
+                  const dlong *vmapM,
+                  const dlong *vmapP,
+                  const int *EToB,
+                  const int *EToF,
+                  const int *elementLayer,
+                  const dfloat *U,
+                  const dfloat *phi,
+                  const dfloat *phiEdge,
+                        dfloat s_flux[p_NblockS][p_Nq][p_Nq]){
+
+  const dfloat nx = sgeo[sk*p_Nsgeo+p_NXID];
+  const dfloat ny = sgeo[sk*p_Nsgeo+p_NYID];
+  const dfloat sJ = sgeo[sk*p_Nsgeo+p_SJID];
+  const dfloat invWJ = sgeo[sk*p_Nsgeo+p_WIJID];
+
+  const dlong idM = vmapM[sk];
+  const dlong idP = vmapP[sk];
+
+  const dlong eM = idM/p_Np, nM = idM%p_Np;
+  const dlong eP = idP/p_Np, nP = idP%p_Np;
+
+  const dlong vidM = eM*p_Np*p_NVfields + nM;
+  const dlong vidP = eP*p_Np*p_NVfields + nP;
+
+  const dfloat uM = U[vidM + 0*p_Np], vM = U[vidM + 1*p_Np];
+  dfloat       uP = U[vidP + 0*p_Np], vP = U[vidP + 1*p_Np];
+
+  const dfloat phiM = phiEdge[eM*p_Np*4 + edgeField(face)*p_Np + nM];
+
+  const int bc = EToB[face+p_Nfaces*e];
+  dfloat phiP = phiM;
+  if (bc<=0 && elementLayer[eP]<0) {
+    // band edge: the clipped value (+/- bandClip) outside the band is the upwind data.
+    // (This element's own trace from the start of the step was tried and is unstable:
+    // it carries no upwind information.) The jump to the clipped value sets an error
+    // floor near the interface that decays exponentially with the number of layers.
+    phiP = phi[idP];
+  } else if (bc<=0) {
+    const int faceP = EToF[face+p_Nfaces*e];
+    phiP = phiEdge[eP*p_Np*4 + edgeField(faceP)*p_Np + nP];
+  }
+  if(bc>0){
+    uP = uM; vP = vM;
+    mpsLevelSetDirichletConditions2D(bc, t, x[idM], y[idM], nx, ny, phiM, &phiP);
+  }
+
+  // averaged normal velocity on the face
+  const dfloat un = 0.5*(nx*(uM+uP) + ny*(vM+vP));
+
+  // inflow part only
+  const dfloat unIn = 0.5*(un - fabs(un));
+
+  s_flux[es][j][i] += invWJ*sJ*unIn*(phiM - phiP);
+}
+
+// batch process elements
+@kernel void mpsLevelSetSurfaceQuad2D(const dlong Nlist,
+                                      @restrict const  dlong  *  list,
+                                      @restrict const  dfloat *  sgeo,
+                                      @restrict const  dlong  *  vmapM,
+                                      @restrict const  dlong  *  vmapP,
+                                      @restrict const  int    *  EToB,
+                                      @restrict const  int    *  EToF,
+                                      @restrict const  int    *  elementLayer,
+                                      const dfloat time,
+                                      @restrict const  dfloat *  x,
+                                      @restrict const  dfloat *  y,
+                                      @restrict const  dfloat *  z,
+                                      @restrict const  dfloat *  U,
+                                      @restrict const  dfloat *  phi,
+                                      @restrict const  dfloat *  phiEdge,
+                                      @restrict dfloat *  rhs){
+
+  // for all elements
+  for(dlong eo=0;eo<Nlist;eo+=p_NblockS;@outer(0)){
+
+    // @shared storage for flux terms
+    @shared dfloat s_flux[p_NblockS][p_Nq][p_Nq];
+
+    for(int es=0;es<p_NblockS;++es;@inner(1)){
+      for(int i=0;i<p_Nq;++i;@inner(0)){
+#pragma unroll p_Nq
+        for(int j=0;j<p_Nq;++j){
+          s_flux[es][j][i] = 0.;
+        }
+      }
+    }
+
+    // face 0 & 2
+    for(int es=0;es<p_NblockS;++es;@inner(1)){
+      for(int i=0;i<p_Nq;++i;@inner(0)){
+        const dlong l = eo + es;
+        if(l<Nlist){
+          const dlong e = list[l];
+          const dlong sk0 = e*p_Nfp*p_Nfaces + 0*p_Nfp + i;
+          const dlong sk2 = e*p_Nfp*p_Nfaces + 2*p_Nfp + i;
+
+          surfaceTerms(e, es, sk0, 0, i, 0,      sgeo, time, x, y, vmapM, vmapP, EToB, EToF, elementLayer, U, phi, phiEdge, s_flux);
+          surfaceTerms(e, es, sk2, 2, i, p_Nq-1, sgeo, time, x, y, vmapM, vmapP, EToB, EToF, elementLayer, U, phi, phiEdge, s_flux);
+        }
+      }
+    }
+
+    // face 1 & 3
+    for(int es=0;es<p_NblockS;++es;@inner(1)){
+      for(int j=0;j<p_Nq;++j;@inner(0)){
+        const dlong l = eo + es;
+        if(l<Nlist){
+          const dlong e = list[l];
+          const dlong sk1 = e*p_Nfp*p_Nfaces + 1*p_Nfp + j;
+          const dlong sk3 = e*p_Nfp*p_Nfaces + 3*p_Nfp + j;
+
+          surfaceTerms(e, es, sk1, 1, p_Nq-1, j, sgeo, time, x, y, vmapM, vmapP, EToB, EToF, elementLayer, U, phi, phiEdge, s_flux);
+          surfaceTerms(e, es, sk3, 3, 0, j,      sgeo, time, x, y, vmapM, vmapP, EToB, EToF, elementLayer, U, phi, phiEdge, s_flux);
+        }
+      }
+    }
+
+    // for each node in the element
+    for(int es=0;es<p_NblockS;++es;@inner(1)){
+      for(int i=0;i<p_Nq;++i;@inner(0)){
+        const dlong l = eo + es;
+        if(l<Nlist){
+          const dlong e = list[l];
+#pragma unroll p_Nq
+          for(int j=0;j<p_Nq;++j){
+            const dlong id = e*p_Np+j*p_Nq+i;
+            rhs[id] += s_flux[es][j][i];
+          }
+        }
+      }
+    }
+  }
+}

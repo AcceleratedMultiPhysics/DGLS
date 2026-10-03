@@ -1,0 +1,209 @@
+/*
+
+The MIT License (MIT)
+
+Copyright (c) 2017-2022 Tim Warburton, Noel Chalmers, Jesse Chan, Ali Karakus
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+*/
+
+
+// Right hand side of the flow of time Eikonal equation w_t = -Hbar(p,q), H = |grad w|,
+// for both fields w = u, v (see mpsReinit.okl), on the band elements.
+//  - unmarked elements: LDG gradients with alternating fluxes, p = backward biased
+//    (w* = interior trace where n_i >= 0), q = forward biased, component by component,
+//    lifted with the GLL face weights (strong form).
+//  - marked elements (u or v flagged by the modal detector): first order
+//    backward/forward differences on the GLL subcells,
+//    combined so that p stays backward biased in each physical direction.
+//  - local Lax-Friedrichs Hamiltonian (alpha = 1 since |dH/dp_i| <= 1):
+//    Hbar = |(p+q)/2| - (q_x-p_x)/2 - (q_y-p_y)/2
+// Faces on the domain boundary or on the band edge use w+ = w- (outflow for reinit); with ghostWall, wall faces near
+// the interface impose the contact angle d u/dn = -cos(theta) through the exterior trace (unmarked elements only).
+
+// face data of node (i,j) through face f: returns 1 and the neighbor value if usable
+int faceNeighbor(const dlong e, const int f, const int fn,
+                 const int fld, const dfloat wM,
+                 const dlong *vmapP, const int *EToB, const int *elementLayer,
+                 const dfloat *Q, dfloat *wP){
+  const dlong sk = e*p_Nfp*p_Nfaces + f*p_Nfp + fn;
+  const dlong idP = vmapP[sk];
+  const dlong eP = idP/p_Np, nP = idP%p_Np;
+  if (EToB[f+p_Nfaces*e]>0 || elementLayer[eP]<0) { *wP = wM; return 0; }
+  *wP = Q[eP*p_Np*2 + fld*p_Np + nP];
+  return 1;
+}
+
+@kernel void mpsReinitRhsQuad2D(const dlong Nlist,
+                                @restrict const  dlong  *  list,
+                                @restrict const  dfloat *  vgeo,
+                                @restrict const  dfloat *  sgeo,
+                                @restrict const  dfloat *  D,
+                                @restrict const  dfloat *  gllw,
+                                @restrict const  dlong  *  vmapP,
+                                @restrict const  int    *  EToB,
+                                @restrict const  int    *  elementLayer,
+                                @restrict const  int    *  reinitMark,
+                                @restrict const  int    *  reinitMarkV,
+                                @restrict const  dfloat *  Q,
+                                const int ghostWall,
+                                const dfloat cosTheta,
+                                const dfloat ghostWidth,
+                                @restrict const  dfloat *  phi0,
+                                const dlong Nelements,
+                                @restrict const  long long int *  EToE,
+                                @restrict const  dfloat *  x,
+                                @restrict const  dfloat *  y,
+                                @restrict const  dfloat *  contactPts,
+                                @restrict dfloat *  rhs){
+
+  for(dlong l=0;l<Nlist;++l;@outer(0)){
+
+    @shared dfloat s_D[p_Nq][p_Nq];
+    @shared dfloat s_w[p_Nq];
+    @shared dfloat s_Q[2][p_Nq][p_Nq];
+
+    const dlong e = list[l];
+    const int mark = reinitMark[e] || reinitMarkV[e];
+
+    for(int j=0;j<p_Nq;++j;@inner(1)){
+      for(int i=0;i<p_Nq;++i;@inner(0)){
+        s_D[j][i] = D[j*p_Nq+i];
+        if (j==0) s_w[i] = gllw[i];
+        s_Q[0][j][i] = Q[e*p_Np*2 + 0*p_Np + j*p_Nq + i];
+        s_Q[1][j][i] = Q[e*p_Np*2 + 1*p_Np + j*p_Nq + i];
+      }
+    }
+
+    for(int j=0;j<p_Nq;++j;@inner(1)){
+      for(int i=0;i<p_Nq;++i;@inner(0)){
+
+        const dlong gbase = e*p_Np*p_Nvgeo + j*p_Nq + i;
+        const dfloat rx = vgeo[gbase+p_Np*p_RXID];
+        const dfloat ry = vgeo[gbase+p_Np*p_RYID];
+        const dfloat sx = vgeo[gbase+p_Np*p_SXID];
+        const dfloat sy = vgeo[gbase+p_Np*p_SYID];
+
+        for (int fld=0;fld<2;++fld) {
+          const dfloat wM = s_Q[fld][j][i];
+
+          dfloat px, py, qx, qy;
+
+          if (mark==0) {
+            dfloat dr = 0.0, ds = 0.0;
+            #pragma unroll p_Nq
+            for(int n=0;n<p_Nq;++n){
+              dr += s_D[i][n]*s_Q[fld][j][n];
+              ds += s_D[j][n]*s_Q[fld][n][i];
+            }
+            px = rx*dr + sx*ds; qx = px;
+            py = ry*dr + sy*ds; qy = py;
+            const dfloat volx = px, voly = py;
+
+            // lift the alternating flux corrections on the faces this node lies on
+            for (int f=0;f<p_Nfaces;++f) {
+              int fn = -1;
+              if (f==0 && j==0)      fn = i;
+              if (f==1 && i==p_Nq-1) fn = j;
+              if (f==2 && j==p_Nq-1) fn = i;
+              if (f==3 && i==0)      fn = j;
+              if (fn < 0) continue;
+
+              const dlong sk = e*p_Nfp*p_Nfaces + f*p_Nfp + fn;
+              const dfloat nx = sgeo[sk*p_Nsgeo+p_NXID];
+              const dfloat ny = sgeo[sk*p_Nsgeo+p_NYID];
+              const dfloat sJ = sgeo[sk*p_Nsgeo+p_SJID];
+              const dfloat invWJ = sgeo[sk*p_Nsgeo+p_WIJID];
+
+              dfloat wP;
+              faceNeighbor(e, f, fn, fld, wM, vmapP, EToB, elementLayer, Q, &wP);
+              dfloat jump = invWJ*sJ*(wP - wM);
+
+              // contact angle ghost condition on walls near the interface: the exterior trace is chosen so that the
+              // lifted normal derivative is d u/dn = -cos(theta) for u = phi (+cos(theta) for v = -phi), the
+              // condition of a distance function whose zero line meets the wall at theta (continued through the wall);
+              // only near contact points: weight 1 within h of the nearest contact point, cosine taper to 0 at 2h
+              // (not on walls under a film, where the interface is parallel to the wall)
+              const int bcf = EToB[f+p_Nfaces*e];
+              if (ghostWall && (bcf==1 || bcf==4 || bcf==5) &&
+                  fabs(phi0[e*p_Np + j*p_Nq + i]) < ghostWidth) {
+                // distance to the nearest contact point in the element and its two rings of face neighbours
+                const dlong id = e*p_Np + j*p_Nq + i;
+                dfloat dc2 = 1e60;
+                for (int f1=-1;f1<p_Nfaces;++f1) {
+                  dlong e1 = e;
+                  if (f1>=0) { const long long int n1 = EToE[e*p_Nfaces+f1]; if (n1<0 || n1>=Nelements) continue; e1 = (dlong)n1; }
+                  for (int f2=-1;f2<p_Nfaces;++f2) {
+                    dlong e2 = e1;
+                    if (f2>=0) { const long long int n2 = EToE[e1*p_Nfaces+f2]; if (n2<0 || n2>=Nelements) continue; e2 = (dlong)n2; }
+                    const dfloat cx = contactPts[2*e2], cy = contactPts[2*e2+1];
+                    if (cx > 1e29) continue;
+                    const dfloat d2 = (x[id]-cx)*(x[id]-cx) + (y[id]-cy)*(y[id]-cy);
+                    dc2 = (d2 < dc2) ? d2 : dc2;
+                  }
+                }
+                const dfloat hh = 0.5*ghostWidth, dc = sqrt(dc2);
+                const dfloat wc = (dc <= hh) ? 1.0 : ((dc >= 2.0*hh) ? 0.0 : 0.5*(1.0 + cos(M_PI*(dc-hh)/hh)));
+                const dfloat gnT = (fld==0) ? -cosTheta : cosTheta;
+                jump = (1.0-wc)*jump + wc*(gnT - (volx*nx + voly*ny));
+              }
+
+              // p: w* = w- where n_i >= 0, else w+ ; q: the opposite
+              if (nx < 0.0) px += jump*nx; else qx += jump*nx;
+              if (ny < 0.0) py += jump*ny; else qy += jump*ny;
+            }
+          } else {
+            // subcell differences in reference directions (backward: pr, ps; forward: qr, qs)
+            dfloat wL, wR, wB, wT;
+            dfloat dL, dR, dB, dT;
+            int okL = 1, okR = 1, okB = 1, okT = 1;
+            if (i>0) { wL = s_Q[fld][j][i-1]; dL = 0.5*(s_w[i-1]+s_w[i]); }
+            else     { okL = faceNeighbor(e, 3, j, fld, wM, vmapP, EToB, elementLayer, Q, &wL); dL = s_w[0]; }
+            if (i<p_Nq-1) { wR = s_Q[fld][j][i+1]; dR = 0.5*(s_w[i]+s_w[i+1]); }
+            else          { okR = faceNeighbor(e, 1, j, fld, wM, vmapP, EToB, elementLayer, Q, &wR); dR = s_w[p_Nq-1]; }
+            if (j>0) { wB = s_Q[fld][j-1][i]; dB = 0.5*(s_w[j-1]+s_w[j]); }
+            else     { okB = faceNeighbor(e, 0, i, fld, wM, vmapP, EToB, elementLayer, Q, &wB); dB = s_w[0]; }
+            if (j<p_Nq-1) { wT = s_Q[fld][j+1][i]; dT = 0.5*(s_w[j]+s_w[j+1]); }
+            else          { okT = faceNeighbor(e, 2, i, fld, wM, vmapP, EToB, elementLayer, Q, &wT); dT = s_w[p_Nq-1]; }
+
+            // one-sided differences where no neighbor data exists
+            dfloat pr = (wM - wL)/dL, qr = (wR - wM)/dR;
+            dfloat ps = (wM - wB)/dB, qs = (wT - wM)/dT;
+            if (!okL) pr = qr;
+            if (!okR) qr = pr;
+            if (!okB) ps = qs;
+            if (!okT) qs = ps;
+
+            // backward in x uses backward differences along directions with positive x projection
+            px = ((rx >= 0.0) ? rx*pr : rx*qr) + ((sx >= 0.0) ? sx*ps : sx*qs);
+            qx = ((rx >= 0.0) ? rx*qr : rx*pr) + ((sx >= 0.0) ? sx*qs : sx*ps);
+            py = ((ry >= 0.0) ? ry*pr : ry*qr) + ((sy >= 0.0) ? sy*ps : sy*qs);
+            qy = ((ry >= 0.0) ? ry*qr : ry*pr) + ((sy >= 0.0) ? sy*qs : sy*ps);
+          }
+
+          const dfloat ax = 0.5*(px+qx), ay = 0.5*(py+qy);
+          const dfloat H = sqrt(ax*ax + ay*ay) - 0.5*(qx-px) - 0.5*(qy-py);
+
+          rhs[e*p_Np*2 + fld*p_Np + j*p_Nq + i] = -H;
+        }
+      }
+    }
+  }
+}

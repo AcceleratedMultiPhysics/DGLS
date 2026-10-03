@@ -1,0 +1,87 @@
+/*
+
+The MIT License (MIT)
+
+Copyright (c) 2017-2022 Tim Warburton, Noel Chalmers, Jesse Chan, Ali Karakus
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+*/
+
+
+// per band element in layers 0 and 1: sum over nodes of wJ ||grad phi| - 1| and of wJ
+// (zero elsewhere); their ratio is the mean gradient deviation used as the adaptive
+// reinitialization trigger. (A max is dominated by kinks, e.g. the centerline of a thin
+// filament, where |grad phi| is ill-defined, and fires all the time.)
+@kernel void mpsGradientDeviationQuad2D(const dlong Nlist,
+                                        @restrict const  dlong  *  list,
+                                        @restrict const  int    *  elementLayer,
+                                        @restrict const  dfloat *  vgeo,
+                                        @restrict const  dfloat *  wJ,
+                                        @restrict const  dfloat *  D,
+                                        @restrict const  dfloat *  phi,
+                                        @restrict dfloat *  dev){
+
+  for(dlong l=0;l<Nlist;++l;@outer(0)){
+
+    @shared dfloat s_D[p_Nq][p_Nq];
+    @shared dfloat s_p[p_Nq][p_Nq];
+    @shared dfloat s_dev[p_Nq][p_Nq];
+    @shared dfloat s_w[p_Nq][p_Nq];
+
+    const dlong e = list[l];
+    const int lay = elementLayer[e];
+
+    for(int j=0;j<p_Nq;++j;@inner(1)){
+      for(int i=0;i<p_Nq;++i;@inner(0)){
+        s_D[j][i] = D[j*p_Nq+i];
+        s_p[j][i] = phi[e*p_Np + j*p_Nq + i];
+      }
+    }
+
+    for(int j=0;j<p_Nq;++j;@inner(1)){
+      for(int i=0;i<p_Nq;++i;@inner(0)){
+        dfloat dr = 0.0, ds = 0.0;
+        for(int n=0;n<p_Nq;++n){
+          dr += s_D[i][n]*s_p[j][n];
+          ds += s_D[j][n]*s_p[n][i];
+        }
+        const dlong gbase = e*p_Np*p_Nvgeo + j*p_Nq + i;
+        const dfloat rx = vgeo[gbase+p_Np*p_RXID], ry = vgeo[gbase+p_Np*p_RYID];
+        const dfloat sx = vgeo[gbase+p_Np*p_SXID], sy = vgeo[gbase+p_Np*p_SYID];
+        const dfloat gx = rx*dr + sx*ds, gy = ry*dr + sy*ds;
+        const dfloat w = (lay >= 0 && lay <= 1) ? wJ[e*p_Np + j*p_Nq + i] : 0.0;
+        s_dev[j][i] = w*fabs(sqrt(gx*gx + gy*gy) - 1.0);
+        s_w[j][i] = w;
+      }
+    }
+
+    for(int j=0;j<p_Nq;++j;@inner(1)){
+      for(int i=0;i<p_Nq;++i;@inner(0)){
+        if (i==0 && j==0) {
+          dfloat sd = 0.0, sw = 0.0;
+          for (int jj=0;jj<p_Nq;++jj)
+            for (int ii=0;ii<p_Nq;++ii) { sd += s_dev[jj][ii]; sw += s_w[jj][ii]; }
+          dev[2*l+0] = sd;
+          dev[2*l+1] = sw;
+        }
+      }
+    }
+  }
+}

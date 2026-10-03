@@ -1,0 +1,62 @@
+/*
+
+The MIT License (MIT)
+
+Copyright (c) 2017-2022 Tim Warburton, Noel Chalmers, Jesse Chan, Ali Karakus, Anthony Austin
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+*/
+
+// Drops the first column of the QR factorization,
+//       zeroing the last columns of Q and R
+@kernel void igDropQRFirstColumn(const dlong Ndof,
+                                 @restrict dfloat *c,
+                                 @restrict dfloat *s,
+                                 @restrict dfloat *Q,
+                                 @restrict dfloat *U)
+{
+#define p_NT 256
+
+  // Apply givens in Q and U
+  for (dlong n = 0; n < Ndof; ++n; @tile(p_NT, @outer(0), @inner(0))) {
+    // load first set of data
+    dfloat Qnip1 = Q[0*Ndof + n];
+    dfloat Unip1 = U[0*Ndof + n];
+
+    for (int i = 0; i < p_igNhist - 1; ++i) {
+      const dfloat r_c = c[i];
+      const dfloat r_s = s[i];
+
+      const dfloat Qni = Qnip1;
+      const dfloat Uni = Unip1;
+
+      Qnip1 = Q[Ndof*(i + 1) + n];
+      Unip1 = U[Ndof*(i + 1) + n];
+
+      // Q(:, i:(i + 1)) = Q(:, i:(i + 1))*G';
+      Q[Ndof*i + n] =  r_c*Qni + r_s*Qnip1;
+      Qnip1         = -r_s*Qni + r_c*Qnip1;
+
+      // U(:, i:(i + 1)) = U(:, i:(i + 1))*G';
+      U[Ndof*i + n] =  r_c*Uni + r_s*Unip1;
+      Unip1         = -r_s*Uni + r_c*Unip1;
+    }
+  }
+}

@@ -1,0 +1,147 @@
+/*
+
+The MIT License (MIT)
+
+Copyright (c) 2017-2022 Tim Warburton, Noel Chalmers, Jesse Chan, Ali Karakus
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+*/
+
+
+// Volume term of the level set equation phi_t + u.grad(phi) = 0.
+//  - unmarked elements: DG strong form, rhs = -u.grad(phi)
+//  - marked elements: upwind subcell FV in fluctuation form on the (N+1)x(N+1) GLL
+//    subcells (widths = GLL weights, nodal values = subcell means), using the
+//    contravariant velocity ur = u.grad(r), us = u.grad(s) and the reconstructed
+//    edge states phi^-/phi^+ of each subcell:
+//      dphi_i/dt = -1/w_i [ A+_{i-1/2}(phi^-_i - phi^+_{i-1}) + A-_{i+1/2}(phi^-_{i+1} - phi^+_i)
+//                          + A_i (phi^+_i - phi^-_i) ]
+// Interior subcell faces and the in-cell term are handled here. At element faces the
+// FV fluctuation equals the DG upwind jump term, which the surface kernel adds.
+// NB: the FV part assumes a constant Jacobian per element (affine quads).
+@kernel void mpsLevelSetVolumeQuad2D(const dlong Nlist,
+                                     @restrict const  dlong  *  list,
+                                     @restrict const  dfloat *  vgeo,
+                                     @restrict const  dfloat *  D,
+                                     @restrict const  dfloat *  gllw,
+                                     @restrict const  int    *  elementMark,
+                                     @restrict const  dfloat *  U,
+                                     @restrict const  dfloat *  phi,
+                                     @restrict const  dfloat *  phiEdge,
+                                     @restrict dfloat *  rhs){
+
+  for(dlong l=0;l<Nlist;++l;@outer(0)){
+
+    const dlong e = list[l];
+
+    @shared dfloat s_D[p_Nq][p_Nq];
+    @shared dfloat s_w[p_Nq];
+    @shared dfloat s_phi[p_Nq][p_Nq];
+    @shared dfloat s_ur[p_Nq][p_Nq];
+    @shared dfloat s_us[p_Nq][p_Nq];
+    @shared dfloat s_Lr[p_Nq][p_Nq];
+    @shared dfloat s_Rr[p_Nq][p_Nq];
+    @shared dfloat s_Ls[p_Nq][p_Nq];
+    @shared dfloat s_Rs[p_Nq][p_Nq];
+
+    @exclusive dfloat r_ur, r_us;
+
+    const int mark = elementMark[e];
+
+    for(int j=0;j<p_Nq;++j;@inner(1)){
+      for(int i=0;i<p_Nq;++i;@inner(0)){
+        s_D[j][i] = D[j*p_Nq+i];
+        if (j==0) s_w[i] = gllw[i];
+
+        const dlong id = e*p_Np + j*p_Nq + i;
+        s_phi[j][i] = phi[id];
+
+        if (mark) {
+          const dlong eid = e*p_Np*4 + j*p_Nq + i;
+          s_Lr[j][i] = phiEdge[eid + 0*p_Np];
+          s_Rr[j][i] = phiEdge[eid + 1*p_Np];
+          s_Ls[j][i] = phiEdge[eid + 2*p_Np];
+          s_Rs[j][i] = phiEdge[eid + 3*p_Np];
+        }
+
+        // geometric factors
+        const dlong gbase = e*p_Np*p_Nvgeo + j*p_Nq + i;
+        const dfloat rx = vgeo[gbase+p_Np*p_RXID];
+        const dfloat ry = vgeo[gbase+p_Np*p_RYID];
+        const dfloat sx = vgeo[gbase+p_Np*p_SXID];
+        const dfloat sy = vgeo[gbase+p_Np*p_SYID];
+
+        const dlong vid = e*p_Np*p_NVfields + j*p_Nq + i;
+        const dfloat u = U[vid + 0*p_Np];
+        const dfloat v = U[vid + 1*p_Np];
+
+        // contravariant velocity
+        r_ur = u*rx + v*ry;
+        r_us = u*sx + v*sy;
+        s_ur[j][i] = r_ur;
+        s_us[j][i] = r_us;
+      }
+    }
+
+    for(int j=0;j<p_Nq;++j;@inner(1)){
+      for(int i=0;i<p_Nq;++i;@inner(0)){
+
+        const dlong id = e*p_Np + j*p_Nq + i;
+        const dfloat phin = s_phi[j][i];
+
+        dfloat rhsn = 0.0;
+
+        if (mark==0) {
+          dfloat dphidr = 0.0, dphids = 0.0;
+          #pragma unroll p_Nq
+          for(int n=0;n<p_Nq;++n){
+            dphidr += s_D[i][n]*s_phi[j][n];
+            dphids += s_D[j][n]*s_phi[n][i];
+          }
+          rhsn = -(r_ur*dphidr + r_us*dphids);
+        } else {
+          // r direction: interior subcell faces and in-cell term
+          dfloat fr = r_ur*(s_Rr[j][i] - s_Lr[j][i]);
+          if (i>0) {
+            const dfloat a = 0.5*(s_ur[j][i-1] + r_ur);
+            fr += (a > 0.0 ? a : 0.0)*(s_Lr[j][i] - s_Rr[j][i-1]);
+          }
+          if (i<p_Nq-1) {
+            const dfloat a = 0.5*(r_ur + s_ur[j][i+1]);
+            fr += (a < 0.0 ? a : 0.0)*(s_Lr[j][i+1] - s_Rr[j][i]);
+          }
+          // s direction
+          dfloat fs = r_us*(s_Rs[j][i] - s_Ls[j][i]);
+          if (j>0) {
+            const dfloat a = 0.5*(s_us[j-1][i] + r_us);
+            fs += (a > 0.0 ? a : 0.0)*(s_Ls[j][i] - s_Rs[j-1][i]);
+          }
+          if (j<p_Nq-1) {
+            const dfloat a = 0.5*(r_us + s_us[j+1][i]);
+            fs += (a < 0.0 ? a : 0.0)*(s_Ls[j+1][i] - s_Rs[j][i]);
+          }
+          rhsn = -fr/s_w[i] - fs/s_w[j];
+        }
+
+        rhs[id] = rhsn;
+      }
+    }
+  }
+}

@@ -1,0 +1,325 @@
+/*
+
+The MIT License (MIT)
+
+Copyright (c) 2017-2022 Tim Warburton, Noel Chalmers, Jesse Chan, Ali Karakus
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+*/
+
+
+// Level set reinitialization by the flow of time Eikonal equation
+// (Karakus, Chalmers & Warburton, CAMWA 2022), on the band elements:
+//   u_t + |grad u| = 0, u(0) =  phi0   (arrival time of u = 0 gives phi in phi0 > 0)
+//   v_t + |grad v| = 0, v(0) = -phi0   (arrival time of v = 0 gives -phi in phi0 < 0)
+// Q holds both fields element-major: Q[e*Np*2 + fld*Np + n], fld 0 = u, 1 = v.
+
+// Q = (phi, -phi)
+@kernel void mpsReinitInit(const dlong Nlist,
+                           @restrict const  dlong  *  list,
+                           @restrict const  dfloat *  phi,
+                           @restrict dfloat *  Q){
+
+  for(dlong l=0;l<Nlist;++l;@outer(0)){
+    for(int n=0;n<p_Np;++n;@inner(0)){
+      const dlong e = list[l];
+      const dfloat p = phi[e*p_Np + n];
+      Q[e*p_Np*2 + 0*p_Np + n] =  p;
+      Q[e*p_Np*2 + 1*p_Np + n] = -p;
+    }
+  }
+}
+
+// low storage RK update of both fields
+@kernel void mpsReinitUpdate(const dlong Nlist,
+                             @restrict const  dlong  *  list,
+                             const dfloat dt,
+                             const dfloat rka,
+                             const dfloat rkb,
+                             @restrict const  dfloat *  rhs,
+                             @restrict dfloat *  res,
+                             @restrict dfloat *  Q){
+
+  for(dlong l=0;l<Nlist;++l;@outer(0)){
+    for(int n=0;n<2*p_Np;++n;@inner(0)){
+      const dlong id = list[l]*p_Np*2 + n;
+
+      dfloat r = dt*rhs[id];
+      if (rka != 0.0) r += rka*res[id];
+
+      res[id] = r;
+      Q[id] += rkb*r;
+    }
+  }
+}
+
+// save both fields into history level lev
+@kernel void mpsReinitSaveHistory(const dlong Nlist,
+                                  @restrict const  dlong  *  list,
+                                  const dlong Ntotal,
+                                  const int lev,
+                                  @restrict const  dfloat *  Q,
+                                  @restrict dfloat *  Qhist){
+
+  for(dlong l=0;l<Nlist;++l;@outer(0)){
+    for(int n=0;n<2*p_Np;++n;@inner(0)){
+      const dlong id = list[l]*p_Np*2 + n;
+      Qhist[lev*Ntotal + id] = Q[id];
+    }
+  }
+}
+
+// value of the relevant field at pseudo time level m (m >= -3), using u(-t) = -v(t)
+dfloat histValue(const dfloat *Qhist, const dlong Ntotal, const int m,
+                 const dlong idSelf, const dlong idOther){
+  if (m >= 0) return  Qhist[(m%p_Nhist)*Ntotal + idSelf];
+  else        return -Qhist[((-m)%p_Nhist)*Ntotal + idOther];
+}
+
+// Look for u (phi0 > 0) or v (phi0 < 0) crossing zero on [tau_{k-2}, tau_{k-1}]
+// (or on [tau_{k-1}, tau_k] when last != 0). The root of the cubic through levels
+// k-3..k is found by Newton iterations started from the linear root.
+@kernel void mpsReinitArrival(const dlong Nlist,
+                              @restrict const  dlong  *  list,
+                              const dlong Ntotal,
+                              const int k,
+                              const int last,
+                              const dfloat dtau,
+                              @restrict const  dfloat *  phi0,
+                              @restrict const  dfloat *  Qhist,
+                              @restrict int *  found,
+                              @restrict dfloat *  arrival){
+
+  for(dlong l=0;l<Nlist;++l;@outer(0)){
+    for(int n=0;n<p_Np;++n;@inner(0)){
+      const dlong e = list[l];
+      const dlong id = e*p_Np + n;
+
+      if (!found[id]) {
+        const int fld = (phi0[id] >= 0.0) ? 0 : 1;
+        const dlong idSelf  = e*p_Np*2 + fld*p_Np + n;
+        const dlong idOther = e*p_Np*2 + (1-fld)*p_Np + n;
+
+        const int m0 = last ? k-1 : k-2;   // interval [m0, m0+1]
+        const dfloat a = histValue(Qhist, Ntotal, m0,   idSelf, idOther);
+        const dfloat b = histValue(Qhist, Ntotal, m0+1, idSelf, idOther);
+
+        if (m0 == 0 && a <= 0.0) {
+          found[id] = 1;
+          arrival[id] = 0.0;
+        } else if (a > 0.0 && b <= 0.0) {
+          // cubic through the four levels around the interval
+          const int s0 = last ? k-3 : k-3;
+          dfloat t[4], f[4];
+          for (int j=0;j<4;++j) {
+            t[j] = (s0+j)*dtau;
+            f[j] = histValue(Qhist, Ntotal, s0+j, idSelf, idOther);
+          }
+          const dfloat ta = m0*dtau, tb = (m0+1)*dtau;
+          dfloat x = ta + dtau*a/(a-b);
+
+          for (int it=0;it<4;++it) {
+            dfloat P = 0.0, dP = 0.0;
+            for (int i=0;i<4;++i) {
+              dfloat Li = 1.0, dLi = 0.0;
+              for (int j=0;j<4;++j) {
+                if (j==i) continue;
+                const dfloat den = t[i]-t[j];
+                dLi = dLi*(x-t[j])/den + Li/den;
+                Li *= (x-t[j])/den;
+              }
+              P  += f[i]*Li;
+              dP += f[i]*dLi;
+            }
+            if (dP == 0.0) break;
+            x -= P/dP;
+          }
+          if (!(x >= ta && x <= tb)) x = ta + dtau*a/(a-b); // fall back to linear
+
+          found[id] = 1;
+          arrival[id] = x;
+        }
+      }
+    }
+  }
+}
+
+// phi = +/- arrival time; nodes without a crossing get +/- Tmax
+@kernel void mpsReinitFinalize(const dlong Nlist,
+                               @restrict const  dlong  *  list,
+                               const dfloat Tmax,
+                               @restrict const  int    *  found,
+                               @restrict const  dfloat *  arrival,
+                               @restrict dfloat *  phi){
+
+  for(dlong l=0;l<Nlist;++l;@outer(0)){
+    for(int n=0;n<p_Np;++n;@inner(0)){
+      const dlong id = list[l]*p_Np + n;
+      const dfloat sgn = (phi[id] >= 0.0) ? 1.0 : -1.0;
+      phi[id] = sgn*(found[id] ? arrival[id] : Tmax);
+    }
+  }
+}
+
+@kernel void mpsReinitClearFound(const dlong N,
+                                 @restrict int *  found){
+  for(dlong n=0;n<N;++n;@tile(p_blockSize,@outer,@inner)){
+    found[n] = 0;
+  }
+}
+
+// element minimum of each field (for the Hopf-Lax bound)
+@kernel void mpsReinitElementMin(const dlong Nlist,
+                                 @restrict const  dlong  *  list,
+                                 @restrict const  dfloat *  Q,
+                                 @restrict dfloat *  Qmin){
+
+  for(dlong l=0;l<Nlist;++l;@outer(0)){
+    for(int fld=0;fld<2;++fld;@inner(0)){
+      const dlong e = list[l];
+      dfloat m = Q[e*p_Np*2 + fld*p_Np];
+      for (int n=1;n<p_Np;++n) m = (Q[e*p_Np*2 + fld*p_Np + n] < m) ? Q[e*p_Np*2 + fld*p_Np + n] : m;
+      Qmin[e*2 + fld] = m;
+    }
+  }
+}
+
+// Hopf-Lax bounds of the Eikonal flow w(x,t) = min_{|y-x|<=t} w0(y):
+// w is non-increasing in pseudo time and cannot drop below the minimum over the element
+// and its face neighbors at the previous step. Clamping to these bounds removes
+// instabilities triggered by rough data (e.g. near the band edge) without changing
+// the exact solution. Neighbors outside the band or off rank are ignored.
+@kernel void mpsReinitBound(const dlong Nlist,
+                            @restrict const  dlong  *  list,
+                            const dlong Nelements,
+                            @restrict const  long long int *  EToE,
+                            @restrict const  int    *  elementLayer,
+                            @restrict const  dfloat *  Qmin,
+                            @restrict const  dfloat *  Qprev,
+                            @restrict dfloat *  Q){
+
+  for(dlong l=0;l<Nlist;++l;@outer(0)){
+    for(int n=0;n<2*p_Np;++n;@inner(0)){
+      const dlong e = list[l];
+      const int fld = n/p_Np;
+
+      dfloat lo = Qmin[e*2 + fld];
+      for (int f=0;f<p_Nfaces;++f) {
+        const long long int eP = EToE[e*p_Nfaces + f];
+        if (eP >= 0 && eP < Nelements && elementLayer[eP] >= 0) {
+          const dfloat m = Qmin[eP*2 + fld];
+          lo = (m < lo) ? m : lo;
+        }
+      }
+
+      const dlong id = e*p_Np*2 + n;
+      dfloat w = Q[id];
+      const dfloat hi = Qprev[id];
+      w = (w > hi) ? hi : w;
+      w = (w < lo) ? lo : w;
+      Q[id] = w;
+    }
+  }
+}
+
+// Interface preservation in cut elements (layer 0) after reinitialization:
+//  mode 1: restore the level set from before reinitialization (phi0)
+//  mode 2: phi0/|grad phi0| (DG gradient), which keeps the zero level set at the nodes
+//          and makes |grad phi| = 1 there
+@kernel void mpsReinitPreserveCutQuad2D(const dlong Nlist,
+                                        @restrict const  dlong  *  list,
+                                        const int mode,
+                                        @restrict const  int    *  elementLayer,
+                                        @restrict const  dfloat *  vgeo,
+                                        @restrict const  dfloat *  D,
+                                        @restrict const  dfloat *  phi0,
+                                        @restrict dfloat *  phi){
+
+  for(dlong l=0;l<Nlist;++l;@outer(0)){
+
+    @shared dfloat s_D[p_Nq][p_Nq];
+    @shared dfloat s_p[p_Nq][p_Nq];
+
+    const dlong e = list[l];
+    const int cut = (elementLayer[e] == 0);
+
+    for(int j=0;j<p_Nq;++j;@inner(1)){
+      for(int i=0;i<p_Nq;++i;@inner(0)){
+        s_D[j][i] = D[j*p_Nq+i];
+        s_p[j][i] = phi0[e*p_Np + j*p_Nq + i];
+      }
+    }
+
+    for(int j=0;j<p_Nq;++j;@inner(1)){
+      for(int i=0;i<p_Nq;++i;@inner(0)){
+        if (cut) {
+          const dlong id = e*p_Np + j*p_Nq + i;
+          if (mode==1) {
+            phi[id] = s_p[j][i];
+          } else {
+            dfloat dr = 0.0, ds = 0.0;
+            for(int n=0;n<p_Nq;++n){
+              dr += s_D[i][n]*s_p[j][n];
+              ds += s_D[j][n]*s_p[n][i];
+            }
+            const dlong gbase = e*p_Np*p_Nvgeo + j*p_Nq + i;
+            const dfloat rx = vgeo[gbase+p_Np*p_RXID], ry = vgeo[gbase+p_Np*p_RYID];
+            const dfloat sx = vgeo[gbase+p_Np*p_SXID], sy = vgeo[gbase+p_Np*p_SYID];
+            const dfloat gx = rx*dr + sx*ds, gy = ry*dr + sy*ds;
+            const dfloat g = sqrt(gx*gx + gy*gy);
+            phi[id] = (g > 1e-12) ? s_p[j][i]/g : phi[id];
+          }
+        }
+      }
+    }
+  }
+}
+
+// contact points: for every band element, the first zero of phi along a wall face (bc 1, 4, 5), linear interpolation
+// between the bracketing face nodes; (1e30, 1e30) if there is none
+@kernel void mpsWallContactPoints(const dlong Nlist,
+                                  @restrict const  dlong  *  list,
+                                  @restrict const  int    *  EToB,
+                                  @restrict const  dlong  *  vmapM,
+                                  @restrict const  dfloat *  x,
+                                  @restrict const  dfloat *  y,
+                                  @restrict const  dfloat *  phi,
+                                  @restrict dfloat *  cp){
+  for(dlong l=0;l<Nlist;++l;@outer(0)){
+    for(int t=0;t<1;++t;@inner(0)){
+      const dlong e = list[l];
+      dfloat cx = 1e30, cy = 1e30;
+      for (int f=0;f<p_Nfaces && cx > 1e29;++f) {
+        const int bc = EToB[e*p_Nfaces+f];
+        if (!(bc==1 || bc==4 || bc==5)) continue;
+        for (int i=0;i<p_Nfp-1;++i) {
+          const dlong ia = vmapM[e*p_Nfaces*p_Nfp + f*p_Nfp + i], ib = vmapM[e*p_Nfaces*p_Nfp + f*p_Nfp + i+1];
+          const dfloat pa = phi[ia], pb = phi[ib];
+          if (pa*pb <= 0.0 && pa != pb) {
+            const dfloat r = pa/(pa-pb);
+            cx = x[ia] + r*(x[ib]-x[ia]); cy = y[ia] + r*(y[ib]-y[ia]);
+            break;
+          }
+        }
+      }
+      cp[2*e] = cx; cp[2*e+1] = cy;
+    }
+  }
+}

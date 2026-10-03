@@ -1,0 +1,143 @@
+/*
+
+The MIT License (MIT)
+
+Copyright (c) 2017-2022 Tim Warburton, Noel Chalmers, Jesse Chan, Ali Karakus
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+*/
+
+
+// Variable coefficient pressure Poisson (C0, quads): local stiffness action of
+// A p = -div( (1/rho) grad p ) with GLL quadrature, i.e. the elliptic partial Ax kernel
+// with the metric terms weighted by 1/rho at each node (lambda = 0).
+// q is the gathered (global) vector, read through GlobalToLocal (masked nodes = 0).
+
+#define squareThreads                           \
+    for(int j=0; j<p_Nq; ++j; @inner(1))        \
+      for(int i=0; i<p_Nq; ++i; @inner(0))
+
+@kernel void mpsVarPartialAxQuad2D(const dlong Nelements,
+                                   @restrict const  dlong   *  elementList,
+                                   @restrict const  dlong   *  GlobalToLocal,
+                                   @restrict const  dfloat *  ggeo,
+                                   @restrict const  dfloat *  DT,
+                                   @restrict const  dfloat *  irho,
+                                   @restrict const  dfloat *  q,
+                                   @restrict dfloat *  Aq){
+
+  for(dlong e=0;e<Nelements;++e;@outer(0)){
+
+    @shared dfloat s_q[p_Nq][p_Nq];
+    @shared dfloat s_DT[p_Nq][p_Nq];
+
+    @exclusive dlong element;
+    @exclusive dfloat r_qr, r_qs, r_Aq;
+    @exclusive dfloat r_G00, r_G01, r_G11;
+
+    squareThreads{
+      element = elementList[e];
+      const dlong base = i + j*p_Nq + element*p_Np;
+      const dlong id = GlobalToLocal[base];
+      s_q[j][i] = (id!=-1) ? q[id] : 0.0;
+      s_DT[j][i] = DT[j*p_Nq+i];
+    }
+
+    squareThreads{
+      const dlong base = element*p_Nggeo*p_Np + j*p_Nq + i;
+      const dfloat c = irho[element*p_Np + j*p_Nq + i];
+
+      // w*J built into G entries
+      r_G00 = c*ggeo[base+p_G00ID*p_Np];
+      r_G01 = c*ggeo[base+p_G01ID*p_Np];
+      r_G11 = c*ggeo[base+p_G11ID*p_Np];
+
+      dfloat qr = 0.f, qs = 0.f;
+      #pragma unroll p_Nq
+      for(int n=0; n<p_Nq; ++n){
+        qr += s_DT[i][n]*s_q[j][n];
+        qs += s_DT[j][n]*s_q[n][i];
+      }
+      r_qr = qr; r_qs = qs;
+      r_Aq = 0.0;
+    }
+
+    squareThreads{
+      s_q[j][i] = r_G00*r_qr + r_G01*r_qs;
+    }
+
+    squareThreads{
+      dfloat tmp = 0.f;
+      #pragma unroll p_Nq
+      for(int n=0;n<p_Nq;++n) tmp += s_DT[n][i]*s_q[j][n];
+      r_Aq += tmp;
+    }
+
+    squareThreads{
+      s_q[j][i] = r_G01*r_qr + r_G11*r_qs;
+    }
+
+    squareThreads{
+      dfloat tmp = 0.f;
+      #pragma unroll p_Nq
+      for(int n=0;n<p_Nq;++n) tmp += s_DT[n][j]*s_q[n][i];
+      r_Aq += tmp;
+
+      Aq[element*p_Np + j*p_Nq + i] = r_Aq;
+    }
+  }
+}
+
+// out = alpha*wJ*x (local mass weighted right hand side)
+@kernel void mpsMassWeight(const dlong N,
+                           const dfloat alpha,
+                           @restrict const dfloat * wJ,
+                           @restrict const dfloat * x,
+                           @restrict dfloat * out){
+  for(dlong n=0;n<N;++n;@tile(p_blockSize,@outer,@inner)){
+    out[n] = alpha*wJ[n]*x[n];
+  }
+}
+
+// irho = 1/rho
+@kernel void mpsInverse(const dlong N,
+                        @restrict const dfloat * rho,
+                        @restrict dfloat * irho){
+  for(dlong n=0;n<N;++n;@tile(p_blockSize,@outer,@inner)){
+    irho[n] = 1.0/rho[n];
+  }
+}
+
+// U -= c (1/rho) G  (vector field)
+@kernel void mpsVarProject(const dlong Nelements,
+                           const dfloat c,
+                           @restrict const dfloat * irho,
+                           @restrict const dfloat * G,
+                           @restrict dfloat * U){
+  for(dlong e=0;e<Nelements;++e;@outer(0)){
+    for(int n=0;n<p_Np;++n;@inner(0)){
+      const dfloat s = c*irho[e*p_Np + n];
+      for (int fld=0;fld<p_NVfields;++fld) {
+        const dlong id = e*p_Np*p_NVfields + fld*p_Np + n;
+        U[id] -= s*G[id];
+      }
+    }
+  }
+}

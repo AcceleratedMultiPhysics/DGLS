@@ -1,0 +1,143 @@
+/*
+
+The MIT License (MIT)
+
+Copyright (c) 2017-2022 Tim Warburton, Noel Chalmers, Jesse Chan, Ali Karakus
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+*/
+
+
+// Modal decay detector (Kloeckner, Warburton & Hesthaven 2011) on tensor Legendre modes.
+// Modes c_mn are grouped into shells k = max(m,n), k = 1..N (the mean is excluded).
+// A baseline decay is added, the skyline (running max from the top) is taken, and a
+// least squares fit log q_k = log C - s log k gives the decay exponent s.
+// Hard marking with hysteresis: mark if s < sOn, keep a marked element while s < sOff.
+// The field of element e is read at phi[e*stride + offset + n].
+// The baseline is scaled with max(|c_{k>=1}|, E_lin) where E_lin is the modal energy of a
+// unit gradient linear function over the element, so nearly constant far field values
+// (whose tiny modes decay like noise) read as smooth. phi is a length, so this is the
+// natural scale for a signed distance.
+@kernel void mpsLevelSetDetectorQuad2D(const dlong Nlist,
+                                       @restrict const  dlong  *  list,
+                                       @restrict const  dfloat *  vgeo,
+                                       @restrict const  dfloat *  invV,
+                                       const dfloat sOn,
+                                       const dfloat sOff,
+                                       const dlong stride,
+                                       const dlong offset,
+                                       @restrict const  dfloat *  phi,
+                                       @restrict dfloat *  decayRate,
+                                       @restrict int *  elementMark){
+
+  for(dlong l=0;l<Nlist;++l;@outer(0)){
+
+    const dlong e = list[l];
+
+    @shared dfloat s_invV[p_Nq][p_Nq];
+    @shared dfloat s_phi[p_Nq][p_Nq];
+    @shared dfloat s_t[p_Nq][p_Nq];
+    @shared dfloat s_c[p_Nq][p_Nq];
+
+    for(int j=0;j<p_Nq;++j;@inner(1)){
+      for(int i=0;i<p_Nq;++i;@inner(0)){
+        s_invV[j][i] = invV[j*p_Nq+i];
+        s_phi[j][i] = phi[e*stride + offset + j*p_Nq + i];
+      }
+    }
+
+    // transform along r: t[j][m] = sum_i invV[m][i] phi[j][i]
+    for(int j=0;j<p_Nq;++j;@inner(1)){
+      for(int m=0;m<p_Nq;++m;@inner(0)){
+        dfloat t = 0.0;
+        #pragma unroll p_Nq
+        for(int i=0;i<p_Nq;++i) t += s_invV[m][i]*s_phi[j][i];
+        s_t[j][m] = t;
+      }
+    }
+
+    // transform along s: c[n][m] = sum_j invV[n][j] t[j][m]
+    for(int n=0;n<p_Nq;++n;@inner(1)){
+      for(int m=0;m<p_Nq;++m;@inner(0)){
+        dfloat c = 0.0;
+        #pragma unroll p_Nq
+        for(int j=0;j<p_Nq;++j) c += s_invV[n][j]*s_t[j][m];
+        s_c[n][m] = c;
+      }
+    }
+
+    for(int j=0;j<p_Nq;++j;@inner(1)){
+      for(int i=0;i<p_Nq;++i;@inner(0)){
+        if (i==0 && j==0) {
+          dfloat q[p_Nq];
+          dfloat total = 0.0;
+          for(int k=0;k<p_Nq;++k) q[k] = 0.0;
+          for(int n=0;n<p_Nq;++n){
+            for(int m=0;m<p_Nq;++m){
+              const int k = (m>n) ? m : n;
+              q[k] += s_c[n][m]*s_c[n][m];
+            }
+          }
+          for(int k=1;k<p_Nq;++k) total += q[k];
+
+          // element size from its area (sum of J*w)
+          dfloat area = 0.0;
+          for(int n=0;n<p_Np;++n) area += vgeo[e*p_Np*p_Nvgeo + n + p_Np*p_JWID];
+          const dfloat he = sqrt(area);
+
+          // phi = (h/2) r (unit gradient) has the single orthonormal mode c_01 = h/sqrt(3)
+          const dfloat elin = he*he/3.0;
+          const dfloat scale = (total > elin) ? total : elin;
+
+          dfloat s = 2.0*p_N; // smooth (or constant) unless shown otherwise
+
+          if (p_N>1 && total>1e-28) {
+            // baseline decay b_k = k^-N / sqrt(sum_k k^-2N)
+            dfloat bsum = 0.0;
+            for(int k=1;k<p_Nq;++k) { const dfloat kk = k; bsum += pow(kk, -2.0*p_N); }
+            for(int k=1;k<p_Nq;++k) {
+              const dfloat kk = k;
+              const dfloat b = pow(kk, -1.0*p_N)/sqrt(bsum);
+              q[k] = sqrt(q[k] + scale*b*b);
+            }
+            // skyline pessimization
+            for(int k=p_Nq-2;k>=1;--k) q[k] = (q[k] > q[k+1]) ? q[k] : q[k+1];
+
+            // least squares fit over k = 1..N
+            dfloat sx = 0.0, sy = 0.0, sxx = 0.0, sxy = 0.0;
+            for(int k=1;k<p_Nq;++k){
+              const dfloat kk = k;
+              const dfloat x = log(kk);
+              const dfloat y = log(q[k]);
+              sx += x; sy += y; sxx += x*x; sxy += x*y;
+            }
+            const dfloat n = p_N;
+            s = -(n*sxy - sx*sy)/(n*sxx - sx*sx);
+          }
+
+          decayRate[e] = s;
+
+          const int oldMark = elementMark[e];
+          elementMark[e] = (s < sOn || (oldMark && s < sOff)) ? 1 : 0;
+        }
+      }
+    }
+  }
+}

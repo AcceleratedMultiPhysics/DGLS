@@ -1,0 +1,403 @@
+/*
+
+  The MIT License (MIT)
+
+  Copyright (c) 2017-2022 Tim Warburton, Noel Chalmers, Jesse Chan, Ali Karakus
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
+*/
+
+// WARNING: p_blockSize must be a power of 2
+
+@kernel void update0NBFPCG(const dlong N,
+                           const dlong Nblocks,
+                           @restrict const dfloat *u,
+                           @restrict const dfloat *r,
+                           @restrict const dfloat *w,
+                           @restrict dfloat *dots){
+
+  for(dlong b=0;b<Nblocks;++b;@outer(0)){
+
+    @shared dfloat s_dot[3][p_blockSize];
+
+    for(int t=0;t<p_blockSize;++t;@inner(0)){
+
+      dfloat sumudotr = 0, sumudotw = 0, sumrdotr = 0;
+      for(int n=t+b*p_blockSize;n<N;n+=Nblocks*p_blockSize){
+        const dfloat un = u[n];
+        const dfloat rn = r[n];
+        const dfloat wn = w[n];
+        sumudotr += un*rn;
+        sumudotw += un*wn;
+        sumrdotr += rn*rn;
+      }
+
+      s_dot[0][t] = sumudotr;
+      s_dot[1][t] = sumudotw;
+      s_dot[2][t] = sumrdotr;
+    }
+
+#if p_blockSize>512
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t<512) {
+      s_dot[0][t] += s_dot[0][t+512];
+      s_dot[1][t] += s_dot[1][t+512];
+      s_dot[2][t] += s_dot[2][t+512];
+    }
+#endif
+#if p_blockSize>256
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t<256) {
+      s_dot[0][t] += s_dot[0][t+256];
+      s_dot[1][t] += s_dot[1][t+256];
+      s_dot[2][t] += s_dot[2][t+256];
+    }
+#endif
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t<128) {
+      s_dot[0][t] += s_dot[0][t+128];
+      s_dot[1][t] += s_dot[1][t+128];
+      s_dot[2][t] += s_dot[2][t+128];
+    }
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t< 64) {
+      s_dot[0][t] += s_dot[0][t+ 64];
+      s_dot[1][t] += s_dot[1][t+ 64];
+      s_dot[2][t] += s_dot[2][t+ 64];
+    }
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t< 32) {
+      s_dot[0][t] += s_dot[0][t+ 32];
+      s_dot[1][t] += s_dot[1][t+ 32];
+      s_dot[2][t] += s_dot[2][t+ 32];
+    }
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t< 16) {
+      s_dot[0][t] += s_dot[0][t+ 16];
+      s_dot[1][t] += s_dot[1][t+ 16];
+      s_dot[2][t] += s_dot[2][t+ 16];
+    }
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t<  8) {
+      s_dot[0][t] += s_dot[0][t+  8];
+      s_dot[1][t] += s_dot[1][t+  8];
+      s_dot[2][t] += s_dot[2][t+  8];
+    }
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t<  4) {
+      s_dot[0][t] += s_dot[0][t+  4];
+      s_dot[1][t] += s_dot[1][t+  4];
+      s_dot[2][t] += s_dot[2][t+  4];
+    }
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t<  2) {
+      s_dot[0][t] += s_dot[0][t+  2];
+      s_dot[1][t] += s_dot[1][t+  2];
+      s_dot[2][t] += s_dot[2][t+  2];
+    }
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t<  1) {
+      dots[0+3*b] = s_dot[0][0] + s_dot[0][1];
+      dots[1+3*b] = s_dot[1][0] + s_dot[1][1];
+      dots[2+3*b] = s_dot[2][0] + s_dot[2][1];
+    }
+  }
+
+  for(dlong b=0;b<1;++b;@outer(0)){
+
+    @shared dfloat s_dot[3][p_blockSize];
+
+    for(int t=0;t<p_blockSize;++t;@inner(0)){
+
+      dfloat sumudotr = 0, sumudotw = 0, sumrdotr = 0;
+      for(int n=t;n<Nblocks;n+=p_blockSize){
+        sumudotr += dots[0+3*n];
+        sumudotw += dots[1+3*n];
+        sumrdotr += dots[2+3*n];
+      }
+
+      s_dot[0][t] = sumudotr;
+      s_dot[1][t] = sumudotw;
+      s_dot[2][t] = sumrdotr;
+    }
+
+#if p_blockSize>512
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t<512) {
+      s_dot[0][t] += s_dot[0][t+512];
+      s_dot[1][t] += s_dot[1][t+512];
+      s_dot[2][t] += s_dot[2][t+512];
+    }
+#endif
+#if p_blockSize>256
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t<256) {
+      s_dot[0][t] += s_dot[0][t+256];
+      s_dot[1][t] += s_dot[1][t+256];
+      s_dot[2][t] += s_dot[2][t+256];
+    }
+#endif
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t<128) {
+      s_dot[0][t] += s_dot[0][t+128];
+      s_dot[1][t] += s_dot[1][t+128];
+      s_dot[2][t] += s_dot[2][t+128];
+    }
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t< 64) {
+      s_dot[0][t] += s_dot[0][t+ 64];
+      s_dot[1][t] += s_dot[1][t+ 64];
+      s_dot[2][t] += s_dot[2][t+ 64];
+    }
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t< 32) {
+      s_dot[0][t] += s_dot[0][t+ 32];
+      s_dot[1][t] += s_dot[1][t+ 32];
+      s_dot[2][t] += s_dot[2][t+ 32];
+    }
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t< 16) {
+      s_dot[0][t] += s_dot[0][t+ 16];
+      s_dot[1][t] += s_dot[1][t+ 16];
+      s_dot[2][t] += s_dot[2][t+ 16];
+    }
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t<  8) {
+      s_dot[0][t] += s_dot[0][t+  8];
+      s_dot[1][t] += s_dot[1][t+  8];
+      s_dot[2][t] += s_dot[2][t+  8];
+    }
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t<  4) {
+      s_dot[0][t] += s_dot[0][t+  4];
+      s_dot[1][t] += s_dot[1][t+  4];
+      s_dot[2][t] += s_dot[2][t+  4];
+    }
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t<  2) {
+      s_dot[0][t] += s_dot[0][t+  2];
+      s_dot[1][t] += s_dot[1][t+  2];
+      s_dot[2][t] += s_dot[2][t+  2];
+    }
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t<  1) {
+      dots[0] = s_dot[0][0] + s_dot[0][1];
+      dots[1] = s_dot[1][0] + s_dot[1][1];
+      dots[2] = s_dot[2][0] + s_dot[2][1];
+    }
+  }
+}
+
+
+@kernel void update1NBFPCG(const dlong N,
+                           const dlong Nblocks,
+                           @restrict const dfloat *p,
+                           @restrict const dfloat *s,
+                           @restrict const dfloat *q,
+                           @restrict const dfloat *z,
+                           const dfloat alpha,
+                           @restrict dfloat *x,
+                           @restrict dfloat *r,
+                           @restrict dfloat *u,
+                           @restrict dfloat *w,
+                           @restrict dfloat *dots){
+
+  for(dlong b=0;b<Nblocks;++b;@outer(0)){
+
+    @shared dfloat s_dot[4][p_blockSize];
+
+    for(int t=0;t<p_blockSize;++t;@inner(0)){
+
+      dfloat sumudotr = 0;
+      dfloat sumudots = 0;
+      dfloat sumudotw = 0;
+      dfloat sumrdotr = 0;
+
+      for(int n=t+b*p_blockSize;n<N;n+=Nblocks*p_blockSize){
+        dfloat xn = x[n];
+        dfloat rn = r[n];
+        dfloat un = u[n];
+        dfloat wn = w[n];
+
+        const dfloat pn = p[n];
+        const dfloat sn = s[n];
+        const dfloat qn = q[n];
+        const dfloat zn = z[n];
+
+        xn = xn + alpha*pn;
+        rn = rn - alpha*sn;
+        un = un - alpha*qn;
+        wn = wn - alpha*zn;
+
+        sumudotr += un*rn;
+        sumudots += un*sn;
+        sumudotw += un*wn;
+        sumrdotr += rn*rn;
+
+        x[n] = xn;
+        r[n] = rn;
+        u[n] = un;
+        w[n] = wn;
+      }
+
+      s_dot[0][t] = sumudotr;
+      s_dot[1][t] = sumudots;
+      s_dot[2][t] = sumudotw;
+      s_dot[3][t] = sumrdotr;
+    }
+
+
+#if p_blockSize>512
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t<512) {
+      s_dot[0][t] += s_dot[0][t+512];
+      s_dot[1][t] += s_dot[1][t+512];
+      s_dot[2][t] += s_dot[2][t+512];
+      s_dot[3][t] += s_dot[3][t+512];
+    }
+#endif
+#if p_blockSize>256
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t<256) {
+      s_dot[0][t] += s_dot[0][t+256];
+      s_dot[1][t] += s_dot[1][t+256];
+      s_dot[2][t] += s_dot[2][t+256];
+      s_dot[3][t] += s_dot[3][t+256];
+    }
+#endif
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t<128) {
+      s_dot[0][t] += s_dot[0][t+128];
+      s_dot[1][t] += s_dot[1][t+128];
+      s_dot[2][t] += s_dot[2][t+128];
+      s_dot[3][t] += s_dot[3][t+128];
+    }
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t< 64) {
+      s_dot[0][t] += s_dot[0][t+ 64];
+      s_dot[1][t] += s_dot[1][t+ 64];
+      s_dot[2][t] += s_dot[2][t+ 64];
+      s_dot[3][t] += s_dot[3][t+ 64];
+    }
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t< 32) {
+      s_dot[0][t] += s_dot[0][t+ 32];
+      s_dot[1][t] += s_dot[1][t+ 32];
+      s_dot[2][t] += s_dot[2][t+ 32];
+      s_dot[3][t] += s_dot[3][t+ 32];
+    }
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t< 16) {
+      s_dot[0][t] += s_dot[0][t+ 16];
+      s_dot[1][t] += s_dot[1][t+ 16];
+      s_dot[2][t] += s_dot[2][t+ 16];
+      s_dot[3][t] += s_dot[3][t+ 16];
+    }
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t<  8) {
+      s_dot[0][t] += s_dot[0][t+  8];
+      s_dot[1][t] += s_dot[1][t+  8];
+      s_dot[2][t] += s_dot[2][t+  8];
+      s_dot[3][t] += s_dot[3][t+  8];
+    }
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t<  4) {
+      s_dot[0][t] += s_dot[0][t+  4];
+      s_dot[1][t] += s_dot[1][t+  4];
+      s_dot[2][t] += s_dot[2][t+  4];
+      s_dot[3][t] += s_dot[3][t+  4];
+    }
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t<  2) {
+      s_dot[0][t] += s_dot[0][t+  2];
+      s_dot[1][t] += s_dot[1][t+  2];
+      s_dot[2][t] += s_dot[2][t+  2];
+      s_dot[3][t] += s_dot[3][t+  2];
+    }
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t<  1) {
+      dots[0+4*b] = s_dot[0][0] + s_dot[0][1];
+      dots[1+4*b] = s_dot[1][0] + s_dot[1][1];
+      dots[2+4*b] = s_dot[2][0] + s_dot[2][1];
+      dots[3+4*b] = s_dot[3][0] + s_dot[3][1];
+    }
+  }
+
+  for(dlong b=0;b<1;++b;@outer(0)){
+
+    @shared dfloat s_dot[4][p_blockSize];
+
+    for(int t=0;t<p_blockSize;++t;@inner(0)){
+
+      dfloat sumudotr = 0;
+      dfloat sumudots = 0;
+      dfloat sumudotw = 0;
+      dfloat sumrdotr = 0;
+
+      for(int n=t;n<Nblocks;n+=p_blockSize){
+        sumudotr += dots[0+4*n];
+        sumudots += dots[1+4*n];
+        sumudotw += dots[2+4*n];
+        sumrdotr += dots[3+4*n];
+      }
+
+      s_dot[0][t] = sumudotr;
+      s_dot[1][t] = sumudots;
+      s_dot[2][t] = sumudotw;
+      s_dot[3][t] = sumrdotr;
+    }
+
+
+#if p_blockSize>512
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t<512) {
+      s_dot[0][t] += s_dot[0][t+512];
+      s_dot[1][t] += s_dot[1][t+512];
+      s_dot[2][t] += s_dot[2][t+512];
+      s_dot[3][t] += s_dot[3][t+512];
+    }
+#endif
+#if p_blockSize>256
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t<256) {
+      s_dot[0][t] += s_dot[0][t+256];
+      s_dot[1][t] += s_dot[1][t+256];
+      s_dot[2][t] += s_dot[2][t+256];
+      s_dot[3][t] += s_dot[3][t+256];
+    }
+#endif
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t<128) {
+      s_dot[0][t] += s_dot[0][t+128];
+      s_dot[1][t] += s_dot[1][t+128];
+      s_dot[2][t] += s_dot[2][t+128];
+      s_dot[3][t] += s_dot[3][t+128];
+    }
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t< 64) {
+      s_dot[0][t] += s_dot[0][t+ 64];
+      s_dot[1][t] += s_dot[1][t+ 64];
+      s_dot[2][t] += s_dot[2][t+ 64];
+      s_dot[3][t] += s_dot[3][t+ 64];
+    }
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t< 32) {
+      s_dot[0][t] += s_dot[0][t+ 32];
+      s_dot[1][t] += s_dot[1][t+ 32];
+      s_dot[2][t] += s_dot[2][t+ 32];
+      s_dot[3][t] += s_dot[3][t+ 32];
+    }
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t< 16) {
+      s_dot[0][t] += s_dot[0][t+ 16];
+      s_dot[1][t] += s_dot[1][t+ 16];
+      s_dot[2][t] += s_dot[2][t+ 16];
+      s_dot[3][t] += s_dot[3][t+ 16];
+    }
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t<  8) {
+      s_dot[0][t] += s_dot[0][t+  8];
+      s_dot[1][t] += s_dot[1][t+  8];
+      s_dot[2][t] += s_dot[2][t+  8];
+      s_dot[3][t] += s_dot[3][t+  8];
+    }
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t<  4) {
+      s_dot[0][t] += s_dot[0][t+  4];
+      s_dot[1][t] += s_dot[1][t+  4];
+      s_dot[2][t] += s_dot[2][t+  4];
+      s_dot[3][t] += s_dot[3][t+  4];
+    }
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t<  2) {
+      s_dot[0][t] += s_dot[0][t+  2];
+      s_dot[1][t] += s_dot[1][t+  2];
+      s_dot[2][t] += s_dot[2][t+  2];
+      s_dot[3][t] += s_dot[3][t+  2];
+    }
+    for(int t=0;t<p_blockSize;++t;@inner(0)) if(t<  1) {
+      dots[0] = s_dot[0][0] + s_dot[0][1];
+      dots[1] = s_dot[1][0] + s_dot[1][1];
+      dots[2] = s_dot[2][0] + s_dot[2][1];
+      dots[3] = s_dot[3][0] + s_dot[3][1];
+    }
+  }
+}

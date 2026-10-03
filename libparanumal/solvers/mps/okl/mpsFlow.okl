@@ -1,0 +1,223 @@
+/*
+
+The MIT License (MIT)
+
+Copyright (c) 2017-2022 Tim Warburton, Noel Chalmers, Jesse Chan, Ali Karakus
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+*/
+
+
+// Two-phase flow kernels (element-major layouts: scalars X[e*Np+n],
+// vectors U[e*Np*NVfields + fld*Np + n]).
+
+// smoothed Heaviside, 1 inside (phi < 0)
+dfloat mpsFlowHeaviside(const dfloat p, const dfloat eps){
+  if (p < -eps) return 1.0;
+  if (p >  eps) return 0.0;
+  return 0.5*(1.0 - p/eps - sin(M_PI*p/eps)/M_PI);
+}
+
+// rho, mu and H from phi; G = density weighted Heaviside for the surface force:
+//  G = (rhoOut H + (rhoIn - rhoOut) H^2/2)/rhoAvg (Brackbill et al. density scaling,
+//  dG/dH = rho/rhoAvg, G = 0..1), or G = H without scaling
+@kernel void mpsProperties(const dlong N,
+                           const int densityScaling,
+                           const int harmonic,
+                           const dfloat eps,
+                           const dfloat rhoIn,
+                           const dfloat rhoOut,
+                           const dfloat muIn,
+                           const dfloat muOut,
+                           @restrict const  dfloat *  phi,
+                           @restrict dfloat *  rho,
+                           @restrict dfloat *  mu,
+                           @restrict dfloat *  H,
+                           @restrict dfloat *  G){
+  for(dlong n=0;n<N;++n;@tile(p_blockSize,@outer,@inner)){
+    const dfloat h = mpsFlowHeaviside(phi[n], eps);
+    H[n]   = h;
+    rho[n] = harmonic ? 1.0/((1.0 - h)/rhoOut + h/rhoIn) : rhoOut + (rhoIn - rhoOut)*h;
+    mu[n]  = muOut  + (muIn  - muOut)*h;
+    G[n]   = densityScaling ? (rhoOut*h + 0.5*(rhoIn - rhoOut)*h*h)/(0.5*(rhoIn + rhoOut)) : h;
+  }
+}
+
+// out = c0*X0 + c1*X1 + c2*X2
+@kernel void mpsCombine3(const dlong N,
+                         const dfloat c0, @restrict const dfloat * X0,
+                         const dfloat c1, @restrict const dfloat * X1,
+                         const dfloat c2, @restrict const dfloat * X2,
+                         @restrict dfloat * out){
+  for(dlong n=0;n<N;++n;@tile(p_blockSize,@outer,@inner)){
+    dfloat r = c0*X0[n];
+    if (c1 != 0.0) r += c1*X1[n];
+    if (c2 != 0.0) r += c2*X2[n];
+    out[n] = r;
+  }
+}
+
+// n = G/|G| (in place), vector field
+@kernel void mpsNormalize(const dlong Nelements,
+                          @restrict dfloat * G){
+  for(dlong e=0;e<Nelements;++e;@outer(0)){
+    for(int n=0;n<p_Np;++n;@inner(0)){
+      const dlong id = e*p_Np*p_NVfields + n;
+      dfloat g2 = 0.0;
+      for (int fld=0;fld<p_NVfields;++fld) g2 += G[id+fld*p_Np]*G[id+fld*p_Np];
+      const dfloat ig = (g2 > 1e-24) ? 1.0/sqrt(g2) : 0.0;
+      for (int fld=0;fld<p_NVfields;++fld) G[id+fld*p_Np] *= ig;
+    }
+  }
+}
+
+// continuum surface force F = sigma kappa grad H (in place on GH), H = 1 inside
+@kernel void mpsSurfaceForce(const dlong Nelements,
+                             const dfloat sigma,
+                             @restrict const dfloat * kappa,
+                             @restrict dfloat * GH){
+  for(dlong e=0;e<Nelements;++e;@outer(0)){
+    for(int n=0;n<p_Np;++n;@inner(0)){
+      const dlong id = e*p_Np*p_NVfields + n;
+      const dfloat sk = sigma*kappa[e*p_Np + n];
+      for (int fld=0;fld<p_NVfields;++fld) GH[id+fld*p_Np] *= sk;
+    }
+  }
+}
+
+// Velocity Helmholtz right hand side of the variable density split (step a of JCP 2019
+// eq. 17 plus the density terms):
+//  rhs = sum_i b_i U^{n+1-i}/dt + sum_i a_i F(U^{n+1-i}) + V(u~) + g + Fst/rho
+//        - (1/rho - sRho0) grad p~   (sRho0 = 1/rho0 for the Dodd-Ferrante split, 0 incremental)
+// where F = -div(u u) is the ins advection operator and V the explicit viscous remainder.
+@kernel void mpsFlowRhs(const dlong Nelements,
+                        const dfloat dt,
+                        const dfloat b1, const dfloat b2, const dfloat b3,
+                        const dfloat a1, const dfloat a2, const dfloat a3,
+                        @restrict const dfloat * U0, @restrict const dfloat * U1, @restrict const dfloat * U2,
+                        @restrict const dfloat * N0, @restrict const dfloat * N1, @restrict const dfloat * N2,
+                        @restrict const dfloat * V,
+                        @restrict const dfloat * GP,
+                        @restrict const dfloat * Fst,
+                        @restrict const dfloat * rho,
+                        const dfloat sRho0,
+                        const dfloat gx,
+                        const dfloat gy,
+                        @restrict dfloat * rhs){
+  for(dlong e=0;e<Nelements;++e;@outer(0)){
+    for(int n=0;n<p_Np;++n;@inner(0)){
+      const dfloat irho = 1.0/rho[e*p_Np + n];
+      for (int fld=0;fld<p_NVfields;++fld) {
+        const dlong id = e*p_Np*p_NVfields + fld*p_Np + n;
+        dfloat r = b1*U0[id];
+        if (b2 != 0.0) r += b2*U1[id];
+        if (b3 != 0.0) r += b3*U2[id];
+        r /= dt;
+        r += a1*N0[id];
+        if (a2 != 0.0) r += a2*N1[id];
+        if (a3 != 0.0) r += a3*N2[id];
+        r += V[id] + Fst[id]*irho - (irho - sRho0)*GP[id];
+        r += (fld==0) ? gx : gy;
+        rhs[id] = r;
+      }
+    }
+  }
+}
+
+// Modal filter of a vector field (Fischer & Mullen type): U <- F U with the tensor 1D filter
+// F = V diag(sigma) V^{-1} applied along r and s; sigma_k = 1 - alpha ((k-kc)/(N-kc))^2 for
+// k > kc, 1 otherwise (the filter matrix is built on the host).
+@kernel void mpsFilterQuad2D(const dlong Nelements,
+                             @restrict const dfloat * F,
+                             @restrict dfloat * U){
+  for(dlong e=0;e<Nelements;++e;@outer(0)){
+    @shared dfloat s_F[p_Nq][p_Nq];
+    @shared dfloat s_u[p_Nq][p_Nq];
+    @shared dfloat s_t[p_Nq][p_Nq];
+    for (int fld=0;fld<p_NVfields;++fld) {
+      for(int j=0;j<p_Nq;++j;@inner(1)){
+        for(int i=0;i<p_Nq;++i;@inner(0)){
+          if (fld==0) s_F[j][i] = F[j*p_Nq+i];
+          s_u[j][i] = U[e*p_Np*p_NVfields + fld*p_Np + j*p_Nq + i];
+        }
+      }
+      for(int j=0;j<p_Nq;++j;@inner(1)){
+        for(int i=0;i<p_Nq;++i;@inner(0)){
+          dfloat t = 0.0;
+          for (int m=0;m<p_Nq;++m) t += s_F[i][m]*s_u[j][m];
+          s_t[j][i] = t;
+        }
+      }
+      for(int j=0;j<p_Nq;++j;@inner(1)){
+        for(int i=0;i<p_Nq;++i;@inner(0)){
+          dfloat t = 0.0;
+          for (int m=0;m<p_Nq;++m) t += s_F[j][m]*s_t[m][i];
+          U[e*p_Np*p_NVfields + fld*p_Np + j*p_Nq + i] = t;
+        }
+      }
+    }
+  }
+}
+
+// Surface force gradient on the GLL subcell nodes for thin structures: in elements whose largest |kappa| exceeds kThr,
+// the DG gradient of G (which oscillates across a steep, under-resolved profile) is replaced by compact differences of the
+// nodal G along the GLL lines (central inside, one-sided at the element edges), mapped with the metric terms. The flag
+// array records the elements treated (for diagnostics).
+@kernel void mpsSurfaceForceSubcellQuad2D(const dlong Nelements,
+                                          const dfloat kThr,
+                                          @restrict const dfloat * vgeo,
+                                          @restrict const dfloat * gllz,
+                                          @restrict const dfloat * kappa,
+                                          @restrict const dfloat * G,
+                                          @restrict dfloat * GH,
+                                          @restrict int * flag){
+  for(dlong e=0;e<Nelements;++e;@outer(0)){
+    @shared dfloat s_G[p_Nq][p_Nq];
+    @shared dfloat s_r[p_Nq];
+    @shared int s_on[1];
+    for(int j=0;j<p_Nq;++j;@inner(1)){
+      for(int i=0;i<p_Nq;++i;@inner(0)){
+        s_G[j][i] = G[e*p_Np + j*p_Nq + i];
+        if (j==0) s_r[i] = gllz[i];
+        if (i==0 && j==0) {
+          int on = 0;
+          for (int n=0;n<p_Np;++n) if (fabs(kappa[e*p_Np+n]) > kThr) on = 1;
+          s_on[0] = on; flag[e] = on;
+        }
+      }
+    }
+    for(int j=0;j<p_Nq;++j;@inner(1)){
+      for(int i=0;i<p_Nq;++i;@inner(0)){
+        if (s_on[0]) {
+          const int il = (i>0) ? i-1 : i, ir = (i<p_Nq-1) ? i+1 : i;
+          const int jl = (j>0) ? j-1 : j, jr = (j<p_Nq-1) ? j+1 : j;
+          const dfloat Gr = (s_G[j][ir] - s_G[j][il])/(s_r[ir] - s_r[il]);
+          const dfloat Gs = (s_G[jr][i] - s_G[jl][i])/(s_r[jr] - s_r[jl]);
+          const dlong gbase = e*p_Np*p_Nvgeo + j*p_Nq + i;
+          const dfloat rx = vgeo[gbase+p_Np*p_RXID], ry = vgeo[gbase+p_Np*p_RYID];
+          const dfloat sx = vgeo[gbase+p_Np*p_SXID], sy = vgeo[gbase+p_Np*p_SYID];
+          const dlong id = e*p_Np*p_NVfields + j*p_Nq + i;
+          GH[id + 0*p_Np] = rx*Gr + sx*Gs;
+          GH[id + 1*p_Np] = ry*Gr + sy*Gs;
+        }
+      }
+    }
+  }
+}

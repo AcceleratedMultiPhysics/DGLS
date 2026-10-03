@@ -1,0 +1,182 @@
+/*
+
+The MIT License (MIT)
+
+Copyright (c) 2017-2022 Tim Warburton, Noel Chalmers, Jesse Chan, Ali Karakus
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+*/
+
+// Divergence and continuity penalty step (Fehn, Wall & Kronbichler 2017, 2018):
+//   (u,v) + dt [ sum_e tauD_e (div u, div v)_e + sum_f tauC_f ([u.n],[v.n])_f ] = (uhat, v)
+// with tauD_e = zetaD |ubar_e| h_e/(N+1), tauC_f = zetaC (|ubar|^- + |ubar|^+)/2 on interior faces,
+// |ubar_e| the magnitude of the element mean velocity and h_e = sqrt(|E_e|).
+
+// element mean speed |ubar_e| (speed) and tauD_e from the velocity U
+@kernel void insPenaltyTauQuad2D(const dlong Nelements,
+                                 @restrict const  dfloat *  wJ,
+                                 const dfloat zetaD,
+                                 @restrict const  dfloat *  U,
+                                 @restrict dfloat *  speed,
+                                 @restrict dfloat *  tauD){
+
+  for(dlong e=0;e<Nelements;++e;@outer(0)){
+    @shared dfloat s_a[p_Np], s_u[p_Np], s_v[p_Np];
+    for(int n=0;n<p_Np;++n;@inner(0)){
+      const dfloat w = wJ[e*p_Np+n];
+      s_a[n] = w;
+      s_u[n] = w*U[e*p_Np*p_NVfields + 0*p_Np + n];
+      s_v[n] = w*U[e*p_Np*p_NVfields + 1*p_Np + n];
+    }
+    for(int n=0;n<p_Np;++n;@inner(0)){
+      if (n==0) {
+        dfloat a = 0.0, su = 0.0, sv = 0.0;
+        for (int m=0;m<p_Np;++m) { a += s_a[m]; su += s_u[m]; sv += s_v[m]; }
+        const dfloat ub = su/a, vb = sv/a;
+        const dfloat sp = sqrt(ub*ub + vb*vb);
+        speed[e] = sp;
+        tauD[e]  = zetaD*sp*sqrt(a)/(p_Nq);
+      }
+    }
+  }
+}
+
+// AU = M U + dt [A_D U + A_C U]   (element-local storage, NVfields = 2)
+@kernel void insPenaltyAxQuad2D(const dlong Nelements,
+                                @restrict const  dfloat *  vgeo,
+                                @restrict const  dfloat *  sgeo,
+                                @restrict const  dfloat *  DT,
+                                @restrict const  dfloat *  wJ,
+                                @restrict const  dlong  *  vmapM,
+                                @restrict const  dlong  *  vmapP,
+                                @restrict const  int    *  EToB,
+                                const dfloat dt,
+                                const dfloat zetaC,
+                                @restrict const  dfloat *  tauD,
+                                @restrict const  dfloat *  speed,
+                                @restrict const  dfloat *  U,
+                                @restrict dfloat *  AU){
+
+  for(dlong e=0;e<Nelements;++e;@outer(0)){
+
+    @shared dfloat s_D[p_Nq][p_Nq];
+    @shared dfloat s_u[p_Nq][p_Nq];
+    @shared dfloat s_v[p_Nq][p_Nq];
+    @shared dfloat s_fr[p_Nq][p_Nq];   // wJ tau div u * r_x etc.
+    @shared dfloat s_fs[p_Nq][p_Nq];
+    @shared dfloat s_gr[p_Nq][p_Nq];
+    @shared dfloat s_gs[p_Nq][p_Nq];
+    @shared dfloat s_au[p_Nq][p_Nq];
+    @shared dfloat s_av[p_Nq][p_Nq];
+
+    for(int j=0;j<p_Nq;++j;@inner(1)){
+      for(int i=0;i<p_Nq;++i;@inner(0)){
+        s_D[j][i] = DT[j*p_Nq+i];   // s_D[a][b] = D[a][b] = l_b'(r_a)
+        const dlong id = e*p_Np*p_NVfields + j*p_Nq + i;
+        s_u[j][i] = U[id + 0*p_Np];
+        s_v[j][i] = U[id + 1*p_Np];
+      }
+    }
+
+    // nodal divergence and the weighted contravariant fluxes of tau div u
+    for(int j=0;j<p_Nq;++j;@inner(1)){
+      for(int i=0;i<p_Nq;++i;@inner(0)){
+        const dlong gid = e*p_Np*p_Nvgeo + j*p_Nq + i;
+        const dfloat rx = vgeo[gid + p_RXID*p_Np], ry = vgeo[gid + p_RYID*p_Np];
+        const dfloat sx = vgeo[gid + p_SXID*p_Np], sy = vgeo[gid + p_SYID*p_Np];
+        dfloat ur = 0, us = 0, vr = 0, vs = 0;
+        for (int n=0;n<p_Nq;++n) {
+          const dfloat Din = s_D[i][n];   // D[i][n]
+          const dfloat Djn = s_D[j][n];   // D[j][n]
+          ur += Din*s_u[j][n]; vr += Din*s_v[j][n];
+          us += Djn*s_u[n][i]; vs += Djn*s_v[n][i];
+        }
+        const dfloat div = rx*ur + sx*us + ry*vr + sy*vs;
+        const dfloat w = wJ[e*p_Np + j*p_Nq + i];
+        const dfloat t = dt*tauD[e]*w*div;
+        s_fr[j][i] = t*rx; s_fs[j][i] = t*sx;   // x test-derivative
+        s_gr[j][i] = t*ry; s_gs[j][i] = t*sy;   // y test-derivative
+      }
+    }
+
+    // mass + transpose derivatives: sum_n D[n][i] f(n,j) + D[n][j] f(i,n)
+    for(int j=0;j<p_Nq;++j;@inner(1)){
+      for(int i=0;i<p_Nq;++i;@inner(0)){
+        const dfloat w = wJ[e*p_Np + j*p_Nq + i];
+        dfloat au = w*s_u[j][i], av = w*s_v[j][i];
+        for (int n=0;n<p_Nq;++n) {
+          const dfloat Dni = s_D[n][i];   // D[n][i]
+          const dfloat Dnj = s_D[n][j];   // D[n][j]
+          au += Dni*s_fr[j][n] + Dnj*s_fs[n][i];
+          av += Dni*s_gr[j][n] + Dnj*s_gs[n][i];
+        }
+        s_au[j][i] = au; s_av[j][i] = av;
+      }
+    }
+
+    // continuity penalty on interior faces, one face per loop (corners are shared)
+#define penaltyFace(face, i, j, fn)                                              \
+    {                                                                           \
+      const dlong sk = e*p_Nfaces*p_Nfp + face*p_Nfp + fn;                      \
+      if (EToB[e*p_Nfaces+face] <= 0) {                                         \
+        const dlong idM = vmapM[sk], idP = vmapP[sk];                           \
+        const dlong eP = idP/p_Np; const int nP = idP%p_Np;                     \
+        const dfloat nx = sgeo[sk*p_Nsgeo+p_NXID], ny = sgeo[sk*p_Nsgeo+p_NYID];\
+        const dfloat WsJ = sgeo[sk*p_Nsgeo+p_WSJID];                            \
+        const dfloat uP = U[eP*p_Np*p_NVfields + 0*p_Np + nP];                  \
+        const dfloat vP = U[eP*p_Np*p_NVfields + 1*p_Np + nP];                  \
+        const dfloat jn = (s_u[j][i]-uP)*nx + (s_v[j][i]-vP)*ny;                \
+        const dfloat tc = dt*zetaC*0.5*(speed[e] + speed[eP])*WsJ*jn;           \
+        s_au[j][i] += tc*nx; s_av[j][i] += tc*ny;                               \
+      }                                                                         \
+    }
+    for(int j=0;j<p_Nq;++j;@inner(1)){ for(int i=0;i<p_Nq;++i;@inner(0)){ if (j==0) penaltyFace(0, i, 0, i); } }
+    for(int j=0;j<p_Nq;++j;@inner(1)){ for(int i=0;i<p_Nq;++i;@inner(0)){ if (j==0) penaltyFace(1, p_Nq-1, i, i); } }
+    for(int j=0;j<p_Nq;++j;@inner(1)){ for(int i=0;i<p_Nq;++i;@inner(0)){ if (j==0) penaltyFace(2, i, p_Nq-1, i); } }
+    for(int j=0;j<p_Nq;++j;@inner(1)){ for(int i=0;i<p_Nq;++i;@inner(0)){ if (j==0) penaltyFace(3, 0, i, i); } }
+#undef penaltyFace
+
+    for(int j=0;j<p_Nq;++j;@inner(1)){
+      for(int i=0;i<p_Nq;++i;@inner(0)){
+        const dlong id = e*p_Np*p_NVfields + j*p_Nq + i;
+        AU[id + 0*p_Np] = s_au[j][i];
+        AU[id + 1*p_Np] = s_av[j][i];
+      }
+    }
+  }
+}
+
+// out = wJ.^p .* in  for both fields (p = 1: mass, p = -1: inverse mass / Jacobi preconditioner)
+@kernel void insPenaltyMassQuad2D(const dlong Nelements,
+                                  const int inverse,
+                                  @restrict const  dfloat *  wJ,
+                                  @restrict const  dfloat *  in,
+                                  @restrict dfloat *  out){
+  for(dlong e=0;e<Nelements;++e;@outer(0)){
+    for(int n=0;n<p_Np;++n;@inner(0)){
+      const dfloat w = wJ[e*p_Np+n];
+      const dfloat s = inverse ? 1.0/w : w;
+      for (int fld=0;fld<p_NVfields;++fld) {
+        const dlong id = e*p_Np*p_NVfields + fld*p_Np + n;
+        out[id] = s*in[id];
+      }
+    }
+  }
+}
