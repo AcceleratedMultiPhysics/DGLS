@@ -1,8 +1,11 @@
 # Hysing et al. (2009) test case 2 on h=1/80 with the explicit viscous remainder: the same settings as the h=1/20 and h=1/40
-# computations of setupRisingBubbleTC2Quad2D.rc (variable coefficient pressure with C0 pressure, filter 0.05, xi = 6,
-# arithmetic density), only the mesh and a reduced time step differ: the skirts fail at t~1.96 with dt 1.25e-4 and at
-# t~2.14 with dt 6.25e-5, so dt = 3.125e-5 (1/8 of the automatic step) is used. ~15 h to t=3 on a Quadro T2000.
-# run: ./mpsMain setups/setupRisingBubbleTC2ExplicitH80Quad2D.rc > hysingTC2_h80.log
+# computations of setupRisingBubbleTC2Quad2D.rc (variable coefficient pressure with C0 pressure, IPDG velocity, filter 0.05, xi = 6,
+# arithmetic density); only the mesh and the CFL number differ. CFL 0.0625 (= 0.5/8) gives the automatic dt = 3.125e-5
+# (dt = CFL hmin/(N+1)^2 at rest; the level set substep count does not change with CFL). Earlier runs: dt 1.25e-4 failed at t~1.96,
+# dt 6.25e-5 at t~2.14 (skirts); each halving delayed the failure by ~0.18 only, so stability to t=3 at 3.125e-5 is not guaranteed.
+# Cost estimate ~25-40 h to t=3 on a Quadro T2000 (8x the steps of the automatic dt; no restart).
+# run (from solvers/mps): ./mpsMain setups/setupRisingBubbleTC2ExplicitH80Quad2D.rc > /home/ali/Desktop/multiphase/results/phase6/tc2_h80_explicit/hysingTC2_h80.log 2>&1
+# frames every 0.05 (~160 MB each, ~10 GB to t=3) and the log go to /home/ali/Desktop/multiphase/results/phase6/tc2_h80_explicit (read by plot_hysing_bench.py).
 [FORMAT]
 2.0
 
@@ -70,7 +73,7 @@ FLOW
 -0.98
 
 [TIME STEP]
-3.125e-5
+0
 
 [FLOW ORDER]
 2
@@ -91,7 +94,7 @@ FLOW
 TRUE
 
 [OUTPUT FILE NAME]
-hysingTC2_h80
+/home/ali/Desktop/multiphase/results/phase6/tc2_h80_explicit/hysingTC2_h80
 
 [REINITIALIZATION]
 TRUE
@@ -204,7 +207,7 @@ CHEBYSHEV
 1.96
 
 [CFL NUMBER]
-0.5
+0.0625
 
 [PRESSURE ITERATIONS]
 1

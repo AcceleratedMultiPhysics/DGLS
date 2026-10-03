@@ -4,7 +4,9 @@
 # VISCOUS TREATMENT IMPLICIT the automatic time step (2.5e-4 on h=1/80, 5e-4 on h=1/40) is stable.
 # Cost: ~20-26 FGMRES iterations per step (one nu0 velocity solve each); ~14 h to t=3 on a Quadro T2000.
 # Velocity boundary data must be homogeneous (walls) for the implicit option.
-# run: ./mpsMain setups/setupRisingBubbleTC2ImplicitQuad2D.rc > hysingTC2imp_h80.log
+# run (from solvers/mps): ./mpsMain setups/setupRisingBubbleTC2ImplicitQuad2D.rc > /home/ali/Desktop/multiphase/results/phase6/tc2imp_h80/hysingTC2imp_h80.log 2>&1
+# frames (every 0.05, ~160 MB each, ~10 GB to t=3) and the log go to /home/ali/Desktop/multiphase/results/phase6/tc2imp_h80 (plot_hysing_bench.py reads <dir>/<name>.log and <dir>/<name>_0000_*.vtu).
+# No restart: the run must finish in one go. Max FGMRES iterations 40 (h=1/80 needs 20-26; 30 left little margin; ~5 MB per Krylov vector pair on h=1/80).
 [FORMAT]
 2.0
 
@@ -93,7 +95,7 @@ FLOW
 TRUE
 
 [OUTPUT FILE NAME]
-hysingTC2imp_h80
+/home/ali/Desktop/multiphase/results/phase6/tc2imp_h80/hysingTC2imp_h80
 
 [REINITIALIZATION]
 TRUE
@@ -224,4 +226,4 @@ IMPLICIT
 1e-6
 
 [IMPLICIT VISCOUS MAX ITERATIONS]
-30
+40
