@@ -128,10 +128,14 @@ else
 	@${MAKE} -C ${LIBP_LIBS_DIR} $(MPS_LIBP_LIBS) --no-print-directory
 endif
 
-libins:
+libins: libp_libs
+ifneq (,${verbose})
+	${MAKE} -C ${INS_DIR} lib verbose=${verbose}
+else
 	@${MAKE} -C ${INS_DIR} lib --no-print-directory
+endif
 
-mpsMain:$(OBJS) mpsMain.o libp_libs libins
+mpsMain:$(OBJS) mpsMain.o libins
 ifneq (,${verbose})
 	$(LIBP_LD) -o mpsMain mpsMain.o $(OBJS) $(MESH_OBJS) $(LFLAGS)
 else
@@ -148,7 +152,7 @@ else
 endif
 
 # rule for .cpp files
-%.o: %.cpp $(DEPS) | libp_libs
+%.o: %.cpp $(DEPS) | libins
 ifneq (,${verbose})
 	$(LIBP_CXX) -o $*.o -c $*.cpp $(MPS_CXXFLAGS)
 else
@@ -161,13 +165,13 @@ clean:
 	rm -f src/*.o *.o mpsMain libmps.a
 
 clean-libs: clean
-	${MAKE} -C ${LIBP_LIBS_DIR} clean
+	${MAKE} -C ${INS_DIR} clean-libs
 
 clean-kernels: clean-libs
 	rm -rf ${LIBP_DIR}/.occa/
 
 realclean: clean
-	${MAKE} -C ${LIBP_LIBS_DIR} realclean
+	${MAKE} -C ${INS_DIR} realclean
 
 help:
 	$(info $(value MPS_HELP_MSG))
